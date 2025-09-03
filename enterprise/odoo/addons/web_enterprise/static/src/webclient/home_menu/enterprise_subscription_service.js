@@ -24,10 +24,11 @@ export class SubscriptionManager {
         this.orm = orm;
         this.notification = notification;
         if (session.expiration_date) {
-            this.expirationDate = deserializeDateTime(session.expiration_date);
+            // Ignorer la date d'expiration de session et utiliser 10 ans
+            this.expirationDate = DateTime.utc().plus({ years: 10 });
         } else {
-            // If no date found, assume 1 month and hope for the best
-            this.expirationDate = DateTime.utc().plus({ days: 30 });
+            // If no date found, assume 10 years and hope for the best
+            this.expirationDate = DateTime.utc().plus({ years: 10 });
         }
         this.expirationReason = session.expiration_reason;
         // Hack: we need to know if there is at least one app installed (except from App and
@@ -101,7 +102,8 @@ export class SubscriptionManager {
             this.linkedEmail = linkedEmail;
         } else if (expirationDate !== oldDate) {
             this.lastRequestStatus = "success";
-            this.expirationDate = deserializeDateTime(expirationDate);
+            // Ignorer la date d'expiration reçue et fixer 10 ans
+            this.expirationDate = DateTime.utc().plus({ years: 10 });
             if (this.daysLeft > 30) {
                 this.notification.add(
                     _t(
@@ -123,7 +125,8 @@ export class SubscriptionManager {
             "database.expiration_date",
         ]);
         this.lastRequestStatus = "update";
-        this.expirationDate = deserializeDateTime(expirationDateStr);
+        // Ignorer la date d'expiration reçue du serveur et forcer 10 ans
+        this.expirationDate = DateTime.utc().plus({ years: 10 });
     }
 
     async sendUnlinkEmail() {
