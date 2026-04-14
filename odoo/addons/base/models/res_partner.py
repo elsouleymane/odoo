@@ -178,7 +178,7 @@ class PartnerCategory(models.Model):
     def _search_display_name(self, operator, value):
         domain = super()._search_display_name(operator, value)
         if operator.endswith('like'):
-            return [('id', 'child_of', self._search(domain))]
+            return [('id', 'child_of', self._search(list(domain)))]
         return domain
 
 class PartnerTitle(models.Model):
@@ -248,7 +248,7 @@ class Partner(models.Model):
     vat_label = fields.Char(string='Tax ID Label', compute='_compute_vat_label')
     same_vat_partner_id: Partner = fields.Many2one('res.partner', string='Partner with same Tax ID', compute='_compute_same_vat_partner_id', store=False)
     same_company_registry_partner_id: Partner = fields.Many2one('res.partner', string='Partner with same Company Registry', compute='_compute_same_vat_partner_id', store=False)
-    company_registry = fields.Char(string="Company ID", compute='_compute_company_registry', store=True, readonly=False,
+    company_registry = fields.Char(string="Company ID", compute='_compute_company_registry', store=True, readonly=False, index='btree_not_null',
        help="The registry number of the company. Use it if it is different from the Tax ID. It must be unique across all partners of a same country")
     company_registry_label = fields.Char(string='Company ID Label', compute='_compute_company_registry_label')
     bank_ids: ResPartnerBank = fields.One2many('res.partner.bank', 'partner_id', string='Banks')
@@ -371,7 +371,7 @@ class Partner(models.Model):
         if self.company_name or self.parent_id:
             if not name and self.type in displayed_types:
                 name = type_description[self.type]
-            if not self.is_company:
+            if not self.is_company and not self.env.context.get('partner_display_name_hide_company'):
                 name = f"{self.commercial_company_name or self.sudo().parent_id.name}, {name}"
         return name.strip()
 
@@ -432,6 +432,7 @@ class Partner(models.Model):
                 domain += [('id', '!=', partner_id), '!', ('id', 'child_of', partner_id)]
             partner.same_company_registry_partner_id = bool(partner.company_registry) and not partner.parent_id and Partner.search(domain, limit=1)
 
+    @api.depends('vat')
     @api.depends_context('company')
     def _compute_vat_label(self):
         self.vat_label = self.env.company.country_id.vat_label or _("Tax ID")
@@ -771,6 +772,11 @@ class Partner(models.Model):
             vals['website'] = self._clean_website(vals['website'])
         if vals.get('parent_id'):
             vals['company_name'] = False
+        if vals.get('name'):
+            for partner in self:
+                for bank in partner.bank_ids:
+                    if bank.acc_holder_name == partner.name:
+                        bank.acc_holder_name = vals['name']
         if 'company_id' in vals:
             company_id = vals['company_id']
             for partner in self:
@@ -895,7 +901,10 @@ class Partner(models.Model):
                 }
 
     @api.depends('complete_name', 'email', 'vat', 'state_id', 'country_id', 'commercial_company_name')
-    @api.depends_context('show_address', 'partner_show_db_id', 'address_inline', 'show_email', 'show_vat', 'lang')
+    @api.depends_context(
+        'show_address', 'partner_display_name_hide_company', 'partner_show_db_id', 'address_inline',
+        'show_email', 'show_vat', 'lang',
+    )
     def _compute_display_name(self):
         for partner in self:
             name = partner.with_context(lang=self.env.lang)._get_complete_name()

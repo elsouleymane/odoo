@@ -1,6 +1,6 @@
 /** @odoo-module */
 
-import { getTag, isFirefox, isIterable, parseRegExp } from "../hoot_dom_utils";
+import { getTag, isFirefox, isInstanceOf, isIterable, parseRegExp } from "../hoot_dom_utils";
 import { waitUntil } from "./time";
 
 /**
@@ -59,10 +59,10 @@ import { waitUntil } from "./time";
  *
  * @typedef {{
  *  contains?: string;
+ *  count?: number;
  *  displayed?: boolean;
  *  empty?: boolean;
  *  eq?: number;
- *  exact?: number;
  *  first?: boolean;
  *  focusable?: boolean;
  *  has?: boolean;
@@ -90,6 +90,10 @@ import { waitUntil } from "./time";
  *  raw?: boolean;
  * }} QueryTextOptions
  *
+ * @typedef {{
+ *  raw?: boolean;
+ * }} QueryValueOptions
+ *
  * @typedef {"both" | "x" | "y"} ScrollAxis
  *
  * @typedef {import("./time").WaitOptions} WaitOptions
@@ -116,11 +120,9 @@ const {
     innerWidth,
     innerHeight,
     Map,
-    MutationObserver,
     Number: { isInteger: $isInteger, isNaN: $isNaN, parseInt: $parseInt, parseFloat: $parseFloat },
     Object: { entries: $entries, keys: $keys, values: $values },
     RegExp,
-    Set,
     String: { raw: $raw },
     window,
 } = globalThis;
@@ -309,7 +311,7 @@ function generateStringFromLayers(layers, tabSize) {
  */
 function getFiltersDescription(modifierInfo) {
     const description = [];
-    for (const [modifier, content, count] of modifierInfo) {
+    for (const [modifier, content, count = 0] of modifierInfo) {
         const makeLabel = MODIFIER_SUFFIX_LABELS[modifier];
         const elements = plural("element", count);
         if (typeof makeLabel === "function") {
@@ -317,8 +319,20 @@ function getFiltersDescription(modifierInfo) {
         } else {
             description.push(`${count} ${modifier} ${elements}`);
         }
+        if (!count) {
+            // Stop at first null count to avoid situations like:
+            // "found 0 elements, including 0 visible elements, including 0 ..."
+            break;
+        }
     }
     return description;
+}
+
+/**
+ * @param {Node} node
+ */
+function getInlineNodeText(node) {
+    return getNodeText(node, { inline: true });
 }
 
 /**
@@ -332,7 +346,7 @@ function getNodeContent(node) {
         case "textarea":
             return getNodeValue(node);
         case "select":
-            return [...node.selectedOptions].map(getNodeValue).join(",");
+            return [...node.selectedOptions].map((node) => getNodeValue(node)).join(",");
     }
     return getNodeText(node);
 }
@@ -348,6 +362,30 @@ function getNodeIframe(node) {
 /** @type {NodeFilter} */
 function getNodeShadowRoot(node) {
     return node.shadowRoot;
+}
+
+/**
+ * @param {string} pseudoClass
+ */
+function getQueryFilter(pseudoClass, content) {
+    const makeQueryFilter = customPseudoClasses.get(pseudoClass);
+    try {
+        return makeQueryFilter(content);
+    } catch (err) {
+        let message = `error while parsing pseudo-class ':${pseudoClass}'`;
+        const cause = String(err?.message || err);
+        if (cause) {
+            message += `: ${cause}`;
+        }
+        throw new HootDomError(message);
+    }
+}
+
+/**
+ * @param {Node} node
+ */
+function getRawValue(node) {
+    return node.value;
 }
 
 /**
@@ -367,6 +405,17 @@ function getWaitForNoneMessage() {
     const message = `expected 0 elements after %timeout%ms and ${lastQueryMessage}`;
     lastQueryMessage = "";
     return message;
+}
+
+/**
+ *
+ * @param {number} count
+ * @param {Parameters<NodeFilter>[0]} _node
+ * @param {Parameters<NodeFilter>[1]} _i
+ * @param {Parameters<NodeFilter>[2]} nodes
+ */
+function hasNodeCount(count, _node, _i, nodes) {
+    return count === nodes.length;
 }
 
 /**
@@ -404,12 +453,16 @@ function isNodeHaving(selector, node) {
 
 /** @type {NodeFilter} */
 function isNodeHidden(node) {
-    return !isVisible(node);
+    return !isNodeVisible(node);
 }
 
 /** @type {NodeFilter} */
 function isNodeInteractive(node) {
-    return getStyle(node).pointerEvents !== "none";
+    return (
+        getStyle(node).pointerEvents !== "none" &&
+        !node.closest?.("[inert]") &&
+        !getParentFrame(node)?.inert
+    );
 }
 
 /**
@@ -468,28 +521,27 @@ function isWhiteSpace(char) {
 }
 
 /**
- * @param {string} pseudoClass
- * @param {(node: Node) => NodeValue} getContent
+ * @param {(node: Node) => string} getContent
+ * @param {boolean} exact
  */
-function makePatternBasedPseudoClass(pseudoClass, getContent) {
-    return (content) => {
-        let regex;
-        try {
-            regex = parseRegExp(content);
-        } catch (err) {
-            throw selectorError(pseudoClass, err.message);
-        }
-        if (regex instanceof RegExp) {
-            return function containsRegExp(node) {
-                return regex.test(String(getContent(node)));
+function makePseudoClassMatcher(getContent, exact) {
+    return function makePartialMatcher(content) {
+        const regex = parseRegExp(content);
+        if (isInstanceOf(regex, RegExp)) {
+            return function stringMatches(node) {
+                return regex.test(getContent(node));
             };
         } else {
             const lowerContent = content.toLowerCase();
-            return function containsString(node) {
-                return getStringContent(String(getContent(node)))
-                    .toLowerCase()
-                    .includes(lowerContent);
-            };
+            if (exact) {
+                return function stringEquals(node) {
+                    return getContent(node).toLowerCase() === lowerContent;
+                };
+            } else {
+                return function stringContains(node) {
+                    return getContent(node).toLowerCase().includes(lowerContent);
+                };
+            }
         }
     };
 }
@@ -586,7 +638,7 @@ function parseSelector(selector) {
     /**
      * @param {string} selector
      */
-    const addToSelector = (selector) => {
+    function addToSelector(selector) {
         registerChar = false;
         const index = currentPart.length - 1;
         if (typeof currentPart[index] === "string") {
@@ -594,7 +646,7 @@ function parseSelector(selector) {
         } else {
             currentPart.push(selector);
         }
-    };
+    }
 
     /** @type {(string | ReturnType<PseudoClassPredicateBuilder>)[]} */
     const firstPart = [""];
@@ -700,7 +752,6 @@ function parseSelector(selector) {
         if (currentPseudo) {
             if (parens[0] === parens[1]) {
                 const [pseudo, content] = currentPseudo;
-                const makeFilter = customPseudoClasses.get(pseudo);
                 if (pseudo === "iframe" && !currentPart[0].startsWith("iframe")) {
                     // Special case: to optimise the ":iframe" pseudo class, we
                     // always select actual `iframe` elements.
@@ -708,7 +759,7 @@ function parseSelector(selector) {
                     // but this pseudo won't work on non-iframe elements anyway.
                     currentPart[0] = `iframe${currentPart[0]}`;
                 }
-                const filter = makeFilter(getStringContent(content));
+                const filter = getQueryFilter(pseudo, getStringContent(content));
                 selectorFilterDescriptors.set(filter, [pseudo, content]);
                 currentPart.push(filter);
                 currentPseudo = null;
@@ -835,22 +886,24 @@ function registerQueryMessage(filteredNodes, expectedCount) {
 
         // Next message part: initial element count (with selector if string)
         const rootModifierInfo = globalModifierInfo.shift();
-        const [rootModifier, rootContent, initialCount] = rootModifierInfo;
-        if (rootContent) {
-            lastQueryMessage += `: ${initialCount} ${rootModifier} ${JSON.stringify(rootContent)}`;
-        } else {
+        const [, rootContent, initialCount = 0] = rootModifierInfo;
+        if (typeof rootContent === "string") {
+            lastQueryMessage += `: ${initialCount} matching ${JSON.stringify(rootContent)}`;
+            if (selectorFilterDescriptors.size) {
+                // Selector filters will only be available with a custom selector
+                const selectorModifierInfo = [...selectorFilterDescriptors.values()];
+                lastQueryMessage += ` (${getFiltersDescription(selectorModifierInfo).join(" > ")})`;
+            }
+        } else if (filteredCount !== initialCount) {
+            // Do not report count if same as announced initially
             lastQueryMessage += `: ${initialCount} ${plural("element", initialCount)}`;
         }
-
-        if (selectorFilterDescriptors.size) {
-            const selectorModifierInfo = [...selectorFilterDescriptors.values()];
-            lastQueryMessage += ` (${getFiltersDescription(selectorModifierInfo).join(" > ")})`;
+        if (initialCount) {
+            // Next message parts: each count associated with each modifier
+            lastQueryMessage += getFiltersDescription(globalModifierInfo)
+                .map((part) => `, including ${part}`)
+                .join("");
         }
-
-        // Next message parts: each count associated with each modifier
-        lastQueryMessage += getFiltersDescription(globalModifierInfo)
-            .map((part) => `, including ${part}`)
-            .join("");
     } else {
         lastQueryMessage = "";
     }
@@ -862,11 +915,22 @@ function registerQueryMessage(filteredNodes, expectedCount) {
 }
 
 /**
- * @param {string} pseudoClass
- * @param {string} message
+ * Wrapper around '_queryAll' calls to ensure global variables are properly cleaned
+ * up on any thrown error.
+ *
+ * @param {Target} target
+ * @param {QueryOptions} options
  */
-function selectorError(pseudoClass, message) {
-    return new HootDomError(`invalid selector \`:${pseudoClass}\`: ${message}`);
+function _guardedQueryAll(target, options) {
+    try {
+        return _queryAll(target, options);
+    } catch (error) {
+        queryAllLevel = 0;
+        shouldRegisterQueryMessage = false;
+        globalFilterDescriptors.clear();
+        selectorFilterDescriptors.clear();
+        throw error;
+    }
 }
 
 /**
@@ -874,29 +938,30 @@ function selectorError(pseudoClass, message) {
  * @param {QueryOptions} options
  */
 function _queryAll(target, options) {
-    if (!target) {
-        return [];
-    }
-
     queryAllLevel++;
 
-    const { exact, root, ...modifiers } = options || {};
+    const { count, root, ...modifiers } = options || {};
+    if (count !== null && count !== undefined && (!$isInteger(count) || count <= 0)) {
+        throw new HootDomError(`invalid 'count' option: should be a positive integer`);
+    }
 
     /** @type {Node[]} */
     let nodes = [];
     let selector;
 
     if (typeof target === "string") {
-        nodes = root ? _queryAll(root) : [getDefaultRoot()];
+        if (target) {
+            nodes = root ? _queryAll(root) : [getDefaultRoot()];
+        }
         selector = target.trim();
         // HTMLSelectElement is iterable ¯\_(ツ)_/¯
     } else if (isIterable(target) && !isNode(target)) {
         nodes = filterUniqueNodes(target);
-    } else {
+    } else if (target) {
         nodes = filterUniqueNodes([target]);
     }
 
-    globalFilterDescriptors.set("root", ["matching", typeof target === "string" ? target : null]);
+    globalFilterDescriptors.set("root", ["", target]);
     if (selector && nodes.length) {
         if (rCustomPseudoClass.test(selector)) {
             nodes = queryWithCustomSelector(nodes, selector);
@@ -918,15 +983,14 @@ function _queryAll(target, options) {
         if (content === false || !customPseudoClasses.has(modifier)) {
             continue;
         }
-        const makeFilter = customPseudoClasses.get(modifier);
-        const filter = makeFilter(content);
+        const filter = getQueryFilter(modifier, content);
         modifierFilters.push(filter);
         globalFilterDescriptors.set(filter, [modifier, content]);
     }
     const filteredNodes = applyFilters(modifierFilters, nodes);
 
     // Register query message (if needed), and/or throw an error accordingly
-    const message = registerQueryMessage(filteredNodes, exact);
+    const message = registerQueryMessage(filteredNodes, count);
     if (message) {
         throw new HootDomError(message);
     }
@@ -941,7 +1005,7 @@ function _queryAll(target, options) {
  * @param {QueryOptions} options
  */
 function _queryOne(target, options) {
-    return _queryAll(target, { ...options, exact: 1 })[0];
+    return _guardedQueryAll(target, { ...options, count: 1 })[0];
 }
 
 /**
@@ -951,7 +1015,7 @@ function _queryOne(target, options) {
  */
 function _waitForFirst(target, options, isLast) {
     shouldRegisterQueryMessage = isLast;
-    const result = _queryAll(target, options)[0];
+    const result = _guardedQueryAll(target, options)[0];
     shouldRegisterQueryMessage = false;
     return result;
 }
@@ -963,23 +1027,13 @@ function _waitForFirst(target, options, isLast) {
  */
 function _waitForNone(target, options, isLast) {
     shouldRegisterQueryMessage = isLast;
-    const result = _queryAll(target, options).length === 0;
+    const result = _guardedQueryAll(target, options).length === 0;
     shouldRegisterQueryMessage = false;
     return result;
 }
 
 class HootDomError extends Error {
     name = "HootDomError";
-
-    constructor() {
-        super(...arguments);
-
-        // Resets all internal variables as soon as an error is created
-        queryAllLevel = 0;
-        shouldRegisterQueryMessage = false;
-        globalFilterDescriptors.clear();
-        selectorFilterDescriptors.clear();
-    }
 }
 
 // Regexes
@@ -1063,63 +1117,39 @@ let queryAllLevel = 0;
 const customPseudoClasses = new Map();
 
 customPseudoClasses
-    .set("contains", makePatternBasedPseudoClass("contains", getNodeText))
-    .set("displayed", () => {
-        return isNodeDisplayed;
+    .set("contains", makePseudoClassMatcher(getInlineNodeText, false))
+    .set("count", (strCount) => {
+        const count = $parseInt(strCount);
+        if (!$isInteger(count) || count <= 0) {
+            throw new HootDomError(`expected count to be a positive integer (got "${strCount}")`);
+        }
+        return hasNodeCount.bind(null, count);
     })
-    .set("empty", () => {
-        return isEmpty;
-    })
+    .set("displayed", () => isNodeDisplayed)
+    .set("empty", () => isEmpty)
     .set("eq", (strIndex) => {
         const index = $parseInt(strIndex);
         if (!$isInteger(index)) {
-            throw selectorError("eq", `expected index to be an integer (got ${strIndex})`);
+            throw new HootDomError(`expected index to be an integer (got "${strIndex}")`);
         }
         return index;
     })
-    .set("first", () => {
-        return 0;
-    })
-    .set("focusable", () => {
-        return isNodeFocusable;
-    })
-    .set("has", (selector) => {
-        return isNodeHaving.bind(null, selector);
-    })
-    .set("hidden", () => {
-        return isNodeHidden;
-    })
-    .set("iframe", () => {
-        return getNodeIframe;
-    })
-    .set("interactive", () => {
-        return isNodeInteractive;
-    })
-    .set("last", () => {
-        return -1;
-    })
-    .set("not", (selector) => {
-        return isNodeNotMatching.bind(null, selector);
-    })
-    .set("only", () => {
-        return isOnlyNode;
-    })
-    .set("scrollable", (axis) => {
-        return isNodeScrollable.bind(null, axis);
-    })
-    .set("selected", () => {
-        return isNodeSelected;
-    })
-    .set("shadow", () => {
-        return getNodeShadowRoot;
-    })
-    .set("value", makePatternBasedPseudoClass("value", getNodeValue))
-    .set("viewPort", () => {
-        return isNodeInViewPort;
-    })
-    .set("visible", () => {
-        return isNodeVisible;
-    });
+    .set("first", () => 0)
+    .set("focusable", () => isNodeFocusable)
+    .set("has", (selector) => isNodeHaving.bind(null, selector))
+    .set("hidden", () => isNodeHidden)
+    .set("iframe", () => getNodeIframe)
+    .set("interactive", () => isNodeInteractive)
+    .set("last", () => -1)
+    .set("not", (selector) => isNodeNotMatching.bind(null, selector))
+    .set("only", () => isOnlyNode)
+    .set("scrollable", (axis) => isNodeScrollable.bind(null, axis))
+    .set("selected", () => isNodeSelected)
+    .set("shadow", () => getNodeShadowRoot)
+    .set("text", makePseudoClassMatcher(getInlineNodeText, true))
+    .set("value", makePseudoClassMatcher(getRawValue, false))
+    .set("viewPort", () => isNodeInViewPort)
+    .set("visible", () => isNodeVisible);
 
 const rCustomPseudoClass = compilePseudoClassRegex();
 
@@ -1181,9 +1211,13 @@ export function getNodeAttribute(node, attribute) {
 
 /**
  * @param {Node} node
+ * @param {QueryValueOptions} [options]
  * @returns {NodeValue}
  */
-export function getNodeValue(node) {
+export function getNodeValue(node, options) {
+    if (options?.raw) {
+        return getRawValue(node);
+    }
     switch (node.type) {
         case "checkbox":
         case "radio":
@@ -1199,8 +1233,9 @@ export function getNodeValue(node) {
         case "time":
         case "week":
             return node.valueAsDate.toISOString();
+        default:
+            return node.value || "";
     }
-    return node.value;
 }
 
 /**
@@ -1706,7 +1741,7 @@ export function getPreviousFocusableElement(options) {
  * @returns {boolean}
  */
 export function isDisplayed(target) {
-    return _queryAll(target, { displayed: true }).length > 0;
+    return _guardedQueryAll(target, { displayed: true }).length > 0;
 }
 
 /**
@@ -1744,7 +1779,7 @@ export function isEditable(node) {
  * @returns {boolean}
  */
 export function isFocusable(target) {
-    return _queryAll(target, { focusable: true }).length > 0;
+    return _guardedQueryAll(target, { focusable: true }).length > 0;
 }
 
 /**
@@ -1768,7 +1803,7 @@ export function isInDOM(target) {
  * @returns {boolean}
  */
 export function isInViewPort(target) {
-    return _queryAll(target, { viewPort: true }).length > 0;
+    return _guardedQueryAll(target, { viewPort: true }).length > 0;
 }
 
 /**
@@ -1779,7 +1814,7 @@ export function isInViewPort(target) {
  * @returns {boolean}
  */
 export function isScrollable(target, axis) {
-    return _queryAll(target, { scrollable: axis }).length > 0;
+    return _guardedQueryAll(target, { scrollable: axis }).length > 0;
 }
 
 /**
@@ -1795,7 +1830,7 @@ export function isScrollable(target, axis) {
  * @returns {boolean}
  */
 export function isVisible(target) {
-    return _queryAll(target, { visible: true }).length > 0;
+    return _guardedQueryAll(target, { visible: true }).length > 0;
 }
 
 /**
@@ -1812,52 +1847,7 @@ export function isVisible(target) {
  *  matches(buttonEl, ":contains(Submit)");
  */
 export function matches(target, selector) {
-    return elementsMatch(_queryAll(target), selector);
-}
-
-/**
- * Listens for DOM mutations on a given target.
- *
- * This helper has 2 main advantages over directly calling the native MutationObserver:
- * - it ensures a single observer is created for a given target, even if multiple
- *  callbacks are registered;
- * - it keeps track of these observers, which allows to check whether an observer
- *  is still running while it should not, and to disconnect all running observers
- *  at once.
- *
- * @param {HTMLElement} target
- * @param {MutationCallback} callback
- */
-export function observe(target, callback) {
-    if (observers.has(target)) {
-        observers.get(target).callbacks.add(callback);
-    } else {
-        const callbacks = new Set([callback]);
-        const observer = new MutationObserver((mutations, observer) => {
-            for (const callback of callbacks) {
-                callback(mutations, observer);
-            }
-        });
-        observer.observe(target, {
-            attributes: true,
-            characterData: true,
-            childList: true,
-            subtree: true,
-        });
-        observers.set(target, { callbacks, observer });
-    }
-
-    return function disconnect() {
-        if (!observers.has(target)) {
-            return;
-        }
-        const { callbacks, observer } = observers.get(target);
-        callbacks.delete(callback);
-        if (!callbacks.size) {
-            observer.disconnect();
-            observers.delete(target);
-        }
-    };
+    return elementsMatch(_guardedQueryAll(target), selector);
 }
 
 /**
@@ -1873,12 +1863,11 @@ export function observe(target, callback) {
  * This function allows all string selectors supported by the native {@link Element.querySelector}
  * along with some additional custom pseudo-classes:
  *
- * - `:contains(text)`: matches nodes whose *content* matches the given *text*;
- *      * given *text* supports regular expression syntax (e.g. `:contains(/^foo.+/)`)
- *          and is case-insensitive;
- *      * given *text* will be matched against:
- *          - an `<input>`, `<textarea>` or `<select>` element's **value**;
- *          - or any other element's **inner text**.
+ * - `:contains(text)`: matches nodes whose *text content* includes the given *text*.
+ *      * The match is **partial** and **case-insensitive**;
+ *      * Given *text* also supports regular expressions (e.g. `:contains(/^foo.+/)`).
+ * - `:count`: return nodes if their count match the given *count*.
+ *      If not matching, an error is thrown;
  * - `:displayed`: matches nodes that are "displayed" (see {@link isDisplayed});
  * - `:empty`: matches nodes that have an empty *content* (**value** or **inner text**);
  * - `:eq(n)`: matches the *nth* node (0-based index);
@@ -1894,22 +1883,23 @@ export function observe(target, callback) {
  * - `:selected`: matches nodes that are selected (e.g. `<option>` elements);
  * - `:shadow`: matches nodes that have shadow roots, and returns their shadow root;
  * - `:scrollable(axis)`: matches nodes that are scrollable (see {@link isScrollable});
+ * - `:text(text)`: matches nodes whose *content* is strictly equal to the given *text*;
+ *      * The match is **exact**, and **case-insensitive**;
+ *      * Given *text* also supports regular expressions (e.g. `:text(/^foo.+/)`).
+ * - `:value(value)`: matches nodes whose *value* is strictly equal to the given *value*;
+ *      * The match is **partial**, and **case-insensitive**;
+ *      * Given *value* also supports regular expressions (e.g. `:value(/^foo.+/)`).
  * - `:viewPort`: matches nodes that are contained in the current view port (see
  *  {@link isInViewPort});
  * - `:visible`: matches nodes that are "visible" (see {@link isVisible});
  *
  * An `options` object can be specified to filter[1] the results:
- * - `displayed`: whether the nodes must be "displayed" (see {@link isDisplayed});
- * - `exact`: the exact number of nodes to match (throws an error if the number of
- *  nodes doesn't match);
- * - `focusable`: whether the nodes must be "focusable" (see {@link isFocusable});
  * - `root`: the root node to query the selector in (defaults to the current fixture);
- * - `viewPort`: whether the nodes must be partially visible in the current viewport
- *  (see {@link isInViewPort});
- * - `visible`: whether the nodes must be "visible" (see {@link isVisible}).
- *      * This option implies `displayed`
+ * - any of the *custom pseudo-classes* can be given as an option, with the value
+ *  being a boolean for standalone pseudo-classes (e.g. `{ empty: true }`), or a
+ *  string for the others (e.g. `{ contains: "text" }`).
  *
- * [1] these filters (except for `exact` and `root`) achieve the same result as
+ * [1] these filters (except for `count` and `root`) achieve the same result as
  *  using their homonym pseudo-classes on the final group of the given selector
  *  string (e.g. ```queryAll`ul > li:visible`;``` = ```queryAll("ul > li", { visible: true })```).
  *
@@ -1931,14 +1921,15 @@ export function observe(target, callback) {
  *  queryAll`#editor:shadow div`; // -> [div, div, ...] (inside shadow DOM)
  * @example
  *  // with options
- *  queryAll(`div:first`, { exact: 1 }); // -> [div]
+ *  queryAll(`div:first`, { count: 1 }); // -> [div]
  *  queryAll(`div`, { root: queryOne`iframe` }); // -> [div, div, ...]
- *  // redundant, but possible
- *  queryAll(`button:visible`, { visible: true }); // -> [button, button, ...]
+ *  // the next 2 queries will return the same results
+ *  queryAll(`button:visible`); // -> [button, button, ...]
+ *  queryAll(`button`, { visible: true }); // -> [button, button, ...]
  */
 export function queryAll(target, options) {
     [target, options] = parseRawArgs(arguments);
-    return _queryAll(target, options);
+    return _guardedQueryAll(target, options);
 }
 
 /**
@@ -1951,7 +1942,7 @@ export function queryAll(target, options) {
  * @returns {string[]}
  */
 export function queryAllAttributes(target, attribute, options) {
-    return _queryAll(target, options).map((node) => getNodeAttribute(node, attribute));
+    return _guardedQueryAll(target, options).map((node) => getNodeAttribute(node, attribute));
 }
 
 /**
@@ -1964,7 +1955,7 @@ export function queryAllAttributes(target, attribute, options) {
  * @returns {any[]}
  */
 export function queryAllProperties(target, property, options) {
-    return _queryAll(target, options).map((node) => node[property]);
+    return _guardedQueryAll(target, options).map((node) => node[property]);
 }
 
 /**
@@ -1982,7 +1973,7 @@ export function queryAllProperties(target, property, options) {
  */
 export function queryAllRects(target, options) {
     [target, options] = parseRawArgs(arguments);
-    return _queryAll(target, options).map(getNodeRect);
+    return _guardedQueryAll(target, options).map(getNodeRect);
 }
 
 /**
@@ -1995,7 +1986,7 @@ export function queryAllRects(target, options) {
  */
 export function queryAllTexts(target, options) {
     [target, options] = parseRawArgs(arguments);
-    return _queryAll(target, options).map((node) => getNodeText(node, options));
+    return _guardedQueryAll(target, options).map((node) => getNodeText(node, options));
 }
 
 /**
@@ -2003,12 +1994,12 @@ export function queryAllTexts(target, options) {
  * *values* of the matching nodes.
  *
  * @param {Target} target
- * @param {QueryOptions} [options]
+ * @param {QueryOptions & QueryValueOptions} [options]
  * @returns {NodeValue[]}
  */
 export function queryAllValues(target, options) {
     [target, options] = parseRawArgs(arguments);
-    return _queryAll(target, options).map(getNodeValue);
+    return _guardedQueryAll(target, options).map((node) => getNodeValue(node, options));
 }
 
 /**
@@ -2049,24 +2040,24 @@ export function queryAttribute(target, attribute, options) {
  */
 export function queryFirst(target, options) {
     [target, options] = parseRawArgs(arguments);
-    return _queryAll(target, options)[0] || null;
+    return _guardedQueryAll(target, options)[0] || null;
 }
 
 /**
- * Performs a {@link queryAll} with the given arguments, along with a forced `exact: 1`
+ * Performs a {@link queryAll} with the given arguments, along with a forced `count: 1`
  * option to ensure only one node matches the given {@link Target}.
  *
  * The returned value is a single node instead of a list of nodes.
  *
  * @param {Target} target
- * @param {Omit<QueryOptions, "exact">} [options]
+ * @param {Omit<QueryOptions, "count">} [options]
  * @returns {Element}
  */
 export function queryOne(target, options) {
     [target, options] = parseRawArgs(arguments);
-    if ($isInteger(options?.exact)) {
+    if ($isInteger(options?.count)) {
         throw new HootDomError(
-            `cannot call \`queryOne\` with 'exact'=${options.exact}: did you mean to use \`queryAll\`?`
+            `cannot call \`queryOne\` with 'count'=${options.count}: did you mean to use \`queryAll\`?`
         );
     }
     return _queryOne(target, options);
@@ -2108,12 +2099,12 @@ export function queryText(target, options) {
  * the matching node.
  *
  * @param {Target} target
- * @param {QueryOptions} [options]
+ * @param {QueryOptions & QueryValueOptions} [options]
  * @returns {NodeValue}
  */
 export function queryValue(target, options) {
     [target, options] = parseRawArgs(arguments);
-    return getNodeValue(_queryOne(target, options));
+    return getNodeValue(_queryOne(target, options), options);
 }
 
 /**

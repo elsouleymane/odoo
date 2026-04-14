@@ -634,7 +634,7 @@ test("correct sequence of blur, focus and select", async () => {
     await contains(".o-autocomplete input").edit("", { confirm: false });
     await runAllTimers();
     await contains(document.body).click();
-    expect.verifySteps(["blur", "change"]);
+    expect.verifySteps(["change", "blur"]);
     expect(".o-autocomplete .dropdown-menu").toHaveCount(0);
 });
 
@@ -731,13 +731,13 @@ test("tab and shift+tab close the dropdown", async () => {
     expect(dropdown).toBeVisible();
     await press("Tab");
     await animationFrame();
-    expect(dropdown).not.toBeVisible();
+    expect(dropdown).not.toHaveCount();
     // Shift + Tab
     await contains(input).click();
     expect(dropdown).toBeVisible();
     await press("Tab", { shiftKey: true });
     await animationFrame();
-    expect(dropdown).not.toBeVisible();
+    expect(dropdown).not.toHaveCount();
 });
 
 test("autocomplete scrolls when moving with arrows", async () => {

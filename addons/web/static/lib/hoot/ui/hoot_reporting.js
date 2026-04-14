@@ -9,10 +9,10 @@ import { HootTestPath } from "./hoot_test_path";
 import { HootTestResult } from "./hoot_test_result";
 
 /**
+ * @typedef {import("../core/test").Test} Test
+ *
  * @typedef {{
  * }} HootReportingProps
- *
- * @typedef {import("../core/test").Test} Test
  */
 
 //-----------------------------------------------------------------------------
@@ -54,9 +54,21 @@ const issueTemplate = (varName, colorClassName) => /* xml */ `
         </div>
     </t>`;
 
-const sortByDurationAscending = (a, b) => a.duration - b.duration;
+/**
+ * @param {Test} a
+ * @param {Test} b
+ */
+function sortByDurationAscending(a, b) {
+    return a.duration - b.duration;
+}
 
-const sortByDurationDescending = (a, b) => b.duration - a.duration;
+/**
+ * @param {Test} a
+ * @param {Test} b
+ */
+function sortByDurationDescending(a, b) {
+    return b.duration - a.duration;
+}
 
 const COLORS = {
     failed: "text-rose",
@@ -141,6 +153,34 @@ export class HootReporting extends Component {
                                 <strong class="text-primary" t-esc="message.selectedSuiteName" />
                             </t>.
                         </em>
+                    </t>
+                    <t t-elif="!runnerReporting.tests">
+                        <div class="flex flex-col gap-3 p-5 rounded bg-gray-200 dark:bg-gray-800">
+                            <h3 class="border-b border-gray pb-1">
+                                Test runner is ready
+                            </h3>
+                            <div class="flex items-center gap-2">
+                                <t t-if="config.manual">
+                                    <button
+                                        class="bg-btn px-2 py-1 transition-colors rounded"
+                                        t-on-click="onRunClick"
+                                    >
+                                        <strong>Start</strong>
+                                    </button>
+                                    or press
+                                    <kbd class="px-2 py-1 rounded text-primary bg-gray-300 dark:bg-gray-700">
+                                        Enter
+                                    </kbd>
+                                </t>
+                                <t t-else="">
+                                    Waiting for assets
+                                    <div
+                                        class="animate-spin shrink-0 grow-0 w-4 h-4 border-2 border-primary border-t-transparent rounded-full"
+                                        role="status"
+                                    />
+                                </t>
+                            </div>
+                        </div>
                     </t>
                     <t t-else="">
                         <div class="flex flex-col gap-3 p-5 rounded bg-gray-200 dark:bg-gray-800">
@@ -259,7 +299,7 @@ export class HootReporting extends Component {
                 }
                 case "passed": {
                     matchFilter =
-                        !test.config.todo && !test.config.skip && test.results.every((r) => r.pass);
+                        !test.config.todo && !test.config.skip && test.results.some((r) => r.pass);
                     break;
                 }
                 case "skipped": {
@@ -336,6 +376,10 @@ export class HootReporting extends Component {
                 const pass = qp.matchValue(key);
                 return qp.exclude ? !pass : pass;
             });
+    }
+
+    onRunClick() {
+        this.env.runner.manualStart();
     }
 
     /**

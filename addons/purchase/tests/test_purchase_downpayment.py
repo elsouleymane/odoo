@@ -8,11 +8,15 @@ from odoo.tests import tagged
 class TestPurchaseDownpayment(TestPurchaseToInvoiceCommon):
 
     def test_downpayment_basic(self):
+        custom_expense_account = self.company_data['default_account_expense'].copy()
+        self.product_order.property_account_expense_id = custom_expense_account
+
         po = self.init_purchase(confirm=False, products=[self.product_order])
         po.order_line.product_qty = 10.0
         po.button_confirm()
 
         dp_bill = self.init_invoice('in_invoice', amounts=[69.00], post=True)
+        dp_bill.invoice_line_ids.account_id = custom_expense_account
 
         match_lines = self.env['purchase.bill.line.match'].search([('partner_id', '=', self.partner_a.id)])
         action = match_lines.action_add_to_po()
@@ -32,9 +36,9 @@ class TestPurchaseDownpayment(TestPurchaseToInvoiceCommon):
 
         self.assertRecordValues(generated_bill.invoice_line_ids, [
             # pylint: disable=C0326
-            {'product_id': self.product_order.id, 'display_type': 'product',      'quantity': 10, 'is_downpayment': False, 'balance': 10.0 * self.product_order.standard_price},
-            {'product_id': False,                 'display_type': 'line_section', 'quantity': 0,  'is_downpayment': True,  'balance': 0.0},
-            {'product_id': False,                 'display_type': 'product',      'quantity': -1, 'is_downpayment': True,  'balance': -69.0},
+            {'product_id': self.product_order.id, 'display_type': 'product',      'quantity': 10, 'is_downpayment': False, 'balance': 10.0 * self.product_order.standard_price, 'account_id': custom_expense_account.id},
+            {'product_id': False,                 'display_type': 'line_section', 'quantity': 0,  'is_downpayment': True,  'balance': 0.0, 'account_id': False},
+            {'product_id': False,                 'display_type': 'product',      'quantity': -1, 'is_downpayment': True,  'balance': -69.0, 'account_id': custom_expense_account.id},
         ])
 
         # Normal flow: New bill with negative down payment line
@@ -118,3 +122,19 @@ class TestPurchaseDownpayment(TestPurchaseToInvoiceCommon):
             {'account_id': accrued_wizard.account_id.id, 'debit': 0, 'credit': 235.0},
         ])
         self.assertFalse(self.env['account.move'].search(accrued_wizard.create_entries()['domain']).line_ids.filtered(lambda l: l.is_downpayment))
+
+    def test_downpayment_exchange_rate(self):
+        self.env['res.currency.rate'].create({'currency_id': self.other_currency.id, 'rate': 1.5})
+
+        po = self.init_purchase(products=[self.product_order])
+        po.button_confirm()
+        self.init_invoice('in_invoice', amounts=[100.00], post=True, currency=self.other_currency)
+
+        match_lines = self.env['purchase.bill.line.match'].search([('partner_id', '=', self.partner_a.id)])
+        action = match_lines.action_add_to_po()
+
+        wizard = self.env['bill.to.po.wizard'].with_context({**action['context'], 'active_ids': match_lines.ids}).create({})
+        wizard.action_add_downpayment()
+
+        po_dp_line = po.order_line.filtered(lambda l: l.display_type != 'line_section' and l.is_downpayment)
+        self.assertEqual(po_dp_line.price_unit, 66.67)

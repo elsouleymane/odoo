@@ -43,7 +43,7 @@ class AccountMoveLine(models.Model):
             if float_is_zero(quantity, precision_rounding=uom.rounding):
                 continue
 
-            layers = line._get_valued_in_moves().stock_valuation_layer_ids.filtered(lambda svl: svl.product_id == line.product_id and not svl.stock_valuation_layer_id)
+            layers = line._get_valued_in_moves()._get_layers_price_diff().filtered(lambda svl: svl.product_id == line.product_id and not svl.stock_valuation_layer_id)
             if not layers:
                 continue
 
@@ -178,6 +178,8 @@ class AccountMoveLine(models.Model):
             if layer:
                 total_layer_qty_to_invoice = abs(layer.quantity)
                 initial_layer = layer.stock_move_id.origin_returned_move_id.stock_valuation_layer_ids
+                # Filter out revaluation layers (Landed Cost)
+                initial_layer = initial_layer.filtered(lambda svl: not svl.stock_valuation_layer_id)
                 if initial_layer:
                     # `layer` is a return. We will cancel the qty to invoice of the returned layer
                     # /!\ we will cancel the qty not yet invoiced only
@@ -215,7 +217,7 @@ class AccountMoveLine(models.Model):
                     sign = 1
                     layers_to_consume = []
                     for layer in qty_to_invoice_per_layer:
-                        if layer.stock_move_id._is_in():
+                        if layer.stock_move_id._is_in() or layer.stock_move_id._is_dropshipped():
                             layers_to_consume.append((layer, qty_to_invoice_per_layer[layer][1]))
                 while float_compare(aml_qty, 0, precision_rounding=self.product_id.uom_id.rounding) > 0 and layers_to_consume:
                     layer, total_layer_qty_to_invoice = layers_to_consume[0]
@@ -240,6 +242,13 @@ class AccountMoveLine(models.Model):
         aml_price_unit = aml.product_uom_id._compute_price(aml_price_unit, self.product_id.uom_id)
 
         unit_valuation_difference = aml_price_unit - layer_price_unit
+        precision_digits = max(
+            aml.currency_id.decimal_places,
+            layer.currency_id.decimal_places,
+            self.env['decimal.precision'].precision_get('Product Price'),
+        )
+        if float_is_zero(unit_valuation_difference, precision_digits=precision_digits):
+            unit_valuation_difference = 0
 
         # Generate the AML values for the already out quantities
         # convert from company currency to aml currency

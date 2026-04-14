@@ -1,13 +1,14 @@
-import { tourState } from "./tour_state";
-import { config as transitionConfig } from "@web/core/transition";
-import { TourStepAutomatic } from "./tour_step_automatic";
-import { Macro } from "@web/core/macro";
-import { browser } from "@web/core/browser/browser";
-import { enableEventLogs, setupEventActions } from "@web/../lib/hoot-dom/helpers/events";
 import * as hootDom from "@odoo/hoot-dom";
+import { enableEventLogs, setupEventActions } from "@web/../lib/hoot-dom/helpers/events";
+import { browser } from "@web/core/browser/browser";
+import { Macro } from "@web/core/macro";
+import { config as transitionConfig } from "@web/core/transition";
+import { tourState } from "./tour_state";
+import { TourStepAutomatic } from "./tour_step_automatic";
 
 export class TourAutomatic {
     mode = "auto";
+    allowUnload = false;
     constructor(data) {
         Object.assign(this, data);
         this.steps = this.steps.map((step, index) => new TourStepAutomatic(step, this, index));
@@ -63,7 +64,17 @@ export class TourAutomatic {
                         if (delayToCheckUndeterminisms > 0) {
                             await step.checkForUndeterminisms(trigger, delayToCheckUndeterminisms);
                         }
-                        const result = await step.doAction();
+                        if (!step.skipped && step.expectUnloadPage) {
+                            this.allowUnload = true;
+                            setTimeout(() => {
+                                const message = `
+                                    The key { expectUnloadPage } is defined but page has not been unloaded within 20000 ms.
+                                    You probably don't need it.
+                                `.replace(/^\s+/gm, "");
+                                this.throwError(message);
+                            }, 20000);
+                        }
+                        await step.doAction();
                         if (this.debugMode) {
                             console.log(trigger);
                             if (step.skipped) {
@@ -77,7 +88,9 @@ export class TourAutomatic {
                             }
                         }
                         tourState.setCurrentIndex(step.index + 1);
-                        return result;
+                        if (this.allowUnload) {
+                            return "StopTheMacro!";
+                        }
                     },
                 },
             ]);

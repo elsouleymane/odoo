@@ -711,11 +711,11 @@ class TestSaleToInvoice(TestSaleCommon):
         sol_prod_deliver.env.add_to_compute(qty_invoiced_field, sol_prod_deliver)
         self.assertEqual(sol_prod_deliver.qty_invoiced, quantity)
 
-        # Rounding to 0.1, should be rounded with UP (ceil) rounding_method
-        # Not floor or half up rounding.
+        # If rounding of used uom is different from decimal precision, it's the decimal precision
+        # that is used for 'qty_invoiced'. No rounding is done.
         sol_prod_deliver.product_uom.rounding *= 10
         sol_prod_deliver.product_uom.flush_recordset(['rounding'])
-        expected_qty = 5.2
+        expected_qty = 5.13
         qty_invoiced_field = sol_prod_deliver._fields.get('qty_invoiced')
         sol_prod_deliver.env.add_to_compute(qty_invoiced_field, sol_prod_deliver)
         self.assertEqual(sol_prod_deliver.qty_invoiced, expected_qty)
@@ -792,8 +792,8 @@ class TestSaleToInvoice(TestSaleCommon):
     def test_invoice_analytic_rule_with_account_prefix(self):
         """
         Test whether, when an analytic account rule is set within the scope (applicability) of invoice
-        and with an account prefix set,
-        the default analytic account is correctly set during the conversion from so to invoice
+        and with an account prefix set, the default analytic account is correctly set during the conversion from
+        so to invoice. An additional analytic account set manually in another plan is also passed to the invoice.
         """
         self.env.user.groups_id += self.env.ref('analytic.group_analytic_accounting')
         analytic_plan_default = self.env['account.analytic.plan'].create({
@@ -804,6 +804,10 @@ class TestSaleToInvoice(TestSaleCommon):
             })]
         })
         analytic_account_default = self.env['account.analytic.account'].create({'name': 'default', 'plan_id': analytic_plan_default.id})
+        # Create an additional analytic account in another plan
+        analytic_plan_2 = self.env['account.analytic.plan'].create({'name': 'manual'})
+        analytic_account_2 = self.env['account.analytic.account'].create({'name': 'manual', 'plan_id': analytic_plan_2.id})
+        analytic_distribution_manual = {str(analytic_account_2.id): 100}
 
         analytic_distribution_model = self.env['account.analytic.distribution.model'].create({
             'account_prefix': '400000',
@@ -818,10 +822,11 @@ class TestSaleToInvoice(TestSaleCommon):
             'product_id': self.product_a.id
         })
         self.assertFalse(so.order_line.analytic_distribution, "There should be no tag set.")
+        so.order_line.analytic_distribution = analytic_distribution_manual
         so.action_confirm()
         so.order_line.qty_delivered = 1
         aml = so._create_invoices().invoice_line_ids
-        self.assertRecordValues(aml, [{'analytic_distribution': analytic_distribution_model.analytic_distribution}])
+        self.assertRecordValues(aml, [{'analytic_distribution': analytic_distribution_model.analytic_distribution | analytic_distribution_manual}])
 
     def test_invoice_after_product_return_price_not_default(self):
         so = self.env['sale.order'].create({
@@ -1234,10 +1239,10 @@ class TestSaleToInvoice(TestSaleCommon):
         inv = self.sale_order._create_invoices()
 
         # Check the invoice line names
-        self.assertEqual(inv.invoice_line_ids[0].name, f"{so.order_line[0].product_id.display_name} {so.order_line[0].name}", "When the description doesn't contain the product name, it should be added to the invoice line name")
+        self.assertEqual(inv.invoice_line_ids[0].name, f"{so.order_line[0].product_id.display_name}\n{so.order_line[0].name}", "When the description doesn't contain the product name, it should be added to the invoice line name")
         self.assertEqual(inv.invoice_line_ids[1].name, f"{so.order_line[1].name}", "When the description is the product name, the invoice line name should only be the description")
         self.assertEqual(inv.invoice_line_ids[2].name, f"{so.order_line[2].name}", "When description contains the product name, the invoice line name should only be the description")
-        self.assertEqual(inv.invoice_line_ids[3].name, f"{so.order_line[3].product_id.display_name} {so.order_line[3].name}", "When the product name contains the description, the invoice line name should contain the product name and the description")
+        self.assertEqual(inv.invoice_line_ids[3].name, f"{so.order_line[3].product_id.display_name}\n{so.order_line[3].name}", "When the product name contains the description, the invoice line name should contain the product name and the description")
 
     def test_credit_note_automatic_matching(self):
         sale_order = self.env['sale.order'].create({

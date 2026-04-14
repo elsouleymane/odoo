@@ -1,6 +1,6 @@
 /** @odoo-module */
 
-import { getTag, isFirefox, isIterable } from "../hoot_dom_utils";
+import { getColorHex, getTag, isFirefox, isInstanceOf, isIterable } from "../hoot_dom_utils";
 import {
     getActiveElement,
     getDocument,
@@ -24,7 +24,6 @@ import {
     setDimensions,
     toSelector,
 } from "./dom";
-import { microTick } from "./time";
 
 /**
  * @typedef {Target | Promise<Target>} AsyncTarget
@@ -78,6 +77,10 @@ import { microTick } from "./time";
  *
  * @typedef {EventOptions & KeyboardEventInit} KeyboardOptions
  *
+ * @typedef {{
+ *  fullClear?: boolean;
+ * }} KeyDownOptions
+ *
  * @typedef {string | string[]} KeyStrokes
  *
  * @typedef {EventOptions & QueryOptions & {
@@ -99,6 +102,11 @@ import { microTick } from "./time";
  * }} SelectOptions
  *
  * @typedef {"bottom" | "left" | "right" | "top"} Side
+ */
+
+/**
+ * @template T
+ * @typedef {T | () => T} Resolver
  */
 
 /**
@@ -136,6 +144,8 @@ const {
     Event,
     File,
     FocusEvent,
+    HashChangeEvent,
+    HTMLElement,
     KeyboardEvent,
     Math: { ceil: $ceil, max: $max, min: $min },
     MouseEvent,
@@ -158,6 +168,22 @@ const {
 /** @type {Document["createRange"]} */
 const $createRange = document.createRange.bind(document);
 const $toString = Object.prototype.toString;
+
+const $blur = HTMLElement.prototype.blur;
+HTMLElement.prototype.blur = function mockBlur() {
+    if (runTime.changeTarget && runTime.changeTarget === this) {
+        triggerChange();
+    }
+    return $blur.call(this, ...arguments);
+};
+
+const $focus = HTMLElement.prototype.focus;
+HTMLElement.prototype.focus = function mockFocus() {
+    if (runTime.changeTarget && runTime.changeTarget !== this) {
+        triggerChange();
+    }
+    return $focus.call(this, ...arguments);
+};
 
 //-----------------------------------------------------------------------------
 // Internal
@@ -230,25 +256,22 @@ function constrainScrollY(target, y) {
  * @param {DataTransferOptions} options
  */
 function createDataTransfer(options) {
-    const dataTransfer =
-        options?.dataTransfer instanceof DataTransfer ? options.dataTransfer : new DataTransfer();
-    const types = new Set();
+    const dataTransfer = isInstanceOf(options?.dataTransfer, DataTransfer)
+        ? options.dataTransfer
+        : new DataTransfer();
     for (const file of options?.files || []) {
-        if (!(file instanceof File)) {
+        if (!isInstanceOf(file, File)) {
             throw new TypeError(`'DataTransfer.files' list only accepts 'File' objects`);
         }
         dataTransfer.items.add(file);
-        types.add("Files");
     }
     for (const [data, type] of options?.items || []) {
         dataTransfer.items.add(data, type);
-        types.add(type);
     }
 
     $defineProperties(dataTransfer, {
         dropEffect: { value: options?.dropEffect || "none", writable: true },
         effectAllowed: { value: options?.effectAllowed || "all", writable: true },
-        types: { value: [...types], writable: true },
     });
 
     return dataTransfer;
@@ -268,7 +291,7 @@ function deleteSelection(target) {
  *  target: T;
  *  events: EventType[];
  *  additionalEvents?: EventType[];
- *  callback?: (target: T) => any;
+ *  callback?: () => any;
  *  options?: EventInit;
  * }} params
  */
@@ -276,11 +299,9 @@ async function dispatchAndIgnore({ target, events, additionalEvents = [], callba
     for (const eventType of [...events, ...additionalEvents]) {
         runTime.eventsToIgnore.push(eventType);
     }
-    if (callback) {
-        callback(target);
-    }
+    callback?.();
     for (const eventType of events) {
-        await dispatch(target, eventType, options);
+        await _dispatch(target, eventType, options);
     }
 }
 
@@ -295,17 +316,17 @@ async function dispatchAndIgnore({ target, events, additionalEvents = [], callba
  * }} additionalEvents
  */
 async function dispatchPointerEvent(target, eventType, eventInit, { mouse, touch }) {
-    const pointerEvent = await dispatch(target, eventType, eventInit);
+    const pointerEvent = await _dispatch(target, eventType, eventInit);
     let prevented = isPrevented(pointerEvent);
     if (hasTouch()) {
         if (touch && runTime.pointerDownTarget) {
             const [touchEventType, touchEventInit] = touch;
-            await dispatch(runTime.pointerDownTarget, touchEventType, touchEventInit || eventInit);
+            await _dispatch(runTime.pointerDownTarget, touchEventType, touchEventInit || eventInit);
         }
     } else {
         if (mouse && !prevented) {
             const [mouseEventType, mouseEventInit] = mouse;
-            const mouseEvent = await dispatch(target, mouseEventType, mouseEventInit || eventInit);
+            const mouseEvent = await _dispatch(target, mouseEventType, mouseEventInit || eventInit);
             prevented = isPrevented(mouseEvent);
         }
     }
@@ -322,17 +343,24 @@ async function dispatchRelatedEvents(events, eventType, eventInit) {
         if (!event.target || isPrevented(event)) {
             break;
         }
-        await dispatch(event.target, eventType, eventInit);
+        await _dispatch(event.target, eventType, eventInit);
     }
 }
 
 /**
- * @template T
+ * @template T, [R=T]
  * @param {MaybeIterable<T>} value
+ * @param {(item: T) => R} [mapFn]
  * @returns {T[]}
  */
-function ensureArray(value) {
-    return isIterable(value) ? [...value] : [value];
+function ensureArray(value, mapFn) {
+    if (Array.isArray(value)) {
+        return mapFn ? value.map(mapFn) : value;
+    }
+    if (isIterable(value)) {
+        return Array.from(value, mapFn);
+    }
+    return [mapFn ? mapFn(value) : value];
 }
 
 function getCurrentEvents() {
@@ -346,13 +374,20 @@ function getCurrentEvents() {
 
 function getDefaultRunTimeValue() {
     return {
-        isComposing: false,
-
-        // Data transfers
+        // Keyboard & data transfers
+        /** @type {HTMLElement | null} */
+        changeTarget: null,
+        /** @type {(() => any)[]} */
+        changeTargetListeners: [],
         /** @type {DataTransfer | null} */
         clipboardData: null,
         /** @type {DataTransfer | null} */
         dataTransfer: null,
+        /** @type {string | null} */
+        initialValue: null,
+        isComposing: false,
+        /** @type {string | null} */
+        key: null,
 
         // Drag & drop
         canStartDrag: false,
@@ -361,7 +396,6 @@ function getDefaultRunTimeValue() {
 
         // Pointer
         clickCount: 0,
-        key: null,
         /** @type {HTMLElement | null} */
         pointerDownTarget: null,
         pointerDownTimeout: 0,
@@ -536,6 +570,10 @@ function getEventConstructor(eventType) {
         case "unload":
             return [Event, mapEvent];
 
+        // URL events
+        case "hashchange":
+            return [HashChangeEvent, mapEvent];
+
         // Default: base Event constructor
         default:
             return [Event, mapEvent, BUBBLES];
@@ -565,18 +603,23 @@ function getFirstCommonParent(a, b) {
 }
 
 /**
+ * Returns the interactive pointer target from a given element, unless the element
+ * is falsy, or the 'interactive' option is set to `false`.
+ *
+ * If an 'originalTarget' is given, the helper will deliberately throw an error if
+ * no interactive elements are found.
+ *
  * @param {HTMLElement} element
  * @param {QueryOptions} options
+ * @param {AsyncTarget} [originalTarget]
  */
-function getPointerTarget(element, options) {
-    if (options?.interactive === false) {
-        // Explicit 'interactive: false' option
-        // -> element can be a non-interactive element
+function getPointerTarget(element, options, originalTarget) {
+    if (!element || options?.interactive === false) {
         return element;
     }
     const interactiveElement = getInteractiveNode(element);
-    if (!interactiveElement) {
-        queryAny(element, { ...options, interactive: true }); // Will throw if no elements are found
+    if (!interactiveElement && originalTarget) {
+        queryAny(originalTarget, { ...options, interactive: true }); // Will throw if no elements are found
     }
     return interactiveElement;
 }
@@ -659,7 +702,7 @@ function getStringSelection(target) {
 
 /**
  * @param {Node} node
- * @param  {...string} tagNames
+ * @param {...string} tagNames
  */
 function hasTagName(node, ...tagNames) {
     return tagNames.includes(getTag(node));
@@ -713,7 +756,7 @@ function isPrevented(event) {
  * @returns {KeyboardEventInit}
  */
 function parseKeyStrokes(keyStrokes, options) {
-    return (isIterable(keyStrokes) ? [...keyStrokes] : [keyStrokes]).map((key) => {
+    return ensureArray(keyStrokes, (key) => {
         const lower = key.toLowerCase();
         return {
             ...options,
@@ -786,8 +829,9 @@ function registerButton(eventInit, toggle) {
  * @param {Event} ev
  */
 function registerFileInput({ target }) {
-    if (getTag(target) === "input" && target.type === "file") {
-        runTime.fileInput = target;
+    const actualTarget = target.shadowRoot ? target.shadowRoot.activeElement : target;
+    if (getTag(actualTarget) === "input" && actualTarget.type === "file") {
+        runTime.fileInput = actualTarget;
     } else {
         runTime.fileInput = null;
     }
@@ -795,45 +839,35 @@ function registerFileInput({ target }) {
 
 /**
  * @param {EventTarget} target
- * @param {string} initialValue
  * @param {ConfirmAction} confirmAction
  */
-async function registerForChange(target, initialValue, confirmAction) {
-    const dispatchChange = () => target.value !== initialValue && dispatch(target, "change");
-
+async function registerForChange(target, confirmAction) {
     confirmAction &&= confirmAction.toLowerCase();
     if (confirmAction === "auto") {
         confirmAction = getTag(target) === "input" ? "enter" : "blur";
     }
-    if (getTag(target) === "input") {
-        changeTargetListeners.push(
-            on(target, "keydown", (ev) => {
-                if (isPrevented(ev) || ev.key !== "Enter") {
-                    return;
-                }
-                removeChangeTargetListeners();
-                afterNextDispatch = dispatchChange;
-            })
-        );
-    } else if (confirmAction === "enter") {
+
+    const parentDocument = getDocument(target);
+    const parentView = parentDocument.defaultView;
+    if (confirmAction === "enter" && getTag(target) !== "input") {
         throw new HootInteractionError(
             `"enter" confirm action is only supported on <input/> elements`
         );
     }
 
-    changeTargetListeners.push(
-        on(target, "blur", () => {
-            removeChangeTargetListeners();
-            dispatchChange();
-        }),
-        on(target, "change", removeChangeTargetListeners)
+    runTime.changeTarget = target;
+    runTime.changeTargetListeners.push(
+        on(parentView, "focusout", triggerChange),
+        on(parentView, "change", removeChangeTargetListeners)
     );
 
     switch (confirmAction) {
         case "blur": {
-            await _hover(getDocument(target).body, {
-                position: { x: 0, y: 0 },
-            });
+            await _hover(
+                parentDocument.body,
+                { position: { x: 0, y: 0 } },
+                { originalTarget: target }
+            );
             await _click();
             break;
         }
@@ -874,19 +908,31 @@ function registerSpecialKey(eventInit, toggle) {
 }
 
 function removeChangeTargetListeners() {
-    while (changeTargetListeners.length) {
-        changeTargetListeners.pop()();
+    for (const listener of runTime.changeTargetListeners) {
+        listener();
     }
+    runTime.changeTarget = null;
+    runTime.changeTargetListeners = [];
+}
+
+/**
+ * @template T
+ * @param {Resolver<T>} resolver
+ * @returns {T}
+ */
+function resolve(resolver) {
+    return typeof resolver === "function" ? resolver() : resolver;
 }
 
 /**
  * @param {HTMLElement | null} target
+ * @param {QueryOptions} [options]
  */
-function setPointerDownTarget(target) {
+function setPointerDownTarget(target, options) {
     if (runTime.pointerDownTarget) {
         runTime.previousPointerDownTarget = runTime.pointerDownTarget;
     }
-    runTime.pointerDownTarget = target;
+    runTime.pointerDownTarget = getPointerTarget(target, options);
     runTime.canStartDrag = false;
 }
 
@@ -898,7 +944,7 @@ function setupEvents(type, options) {
     currentEventTypes.push(type);
     $assign(currentEventInit, options?.eventInit);
 
-    return () => {
+    return function finalizeEvents() {
         for (const eventType in currentEventInit) {
             delete currentEventInit[eventType];
         }
@@ -908,11 +954,17 @@ function setupEvents(type, options) {
         if (!allowLogs) {
             return events;
         }
-        const groupName = [`${type}: dispatched`, events.length, `events`];
+        const groupName = [
+            `%c[${type}]%c dispatched`,
+            `color: ${getColorHex("purple")}`,
+            "",
+            events.length,
+            `events`,
+        ];
         $groupCollapsed(...groupName);
         for (const event of events) {
-            /** @type {(keyof typeof LOG_COLORS)[]} */
-            const colors = ["blue"];
+            /** @type {string[]} */
+            const colors = [getColorHex("text-report-html-tag")];
 
             const typeList = [event.type];
             if (event.key) {
@@ -920,7 +972,9 @@ function setupEvents(type, options) {
             } else if (event.button) {
                 typeList.push(event.button);
             }
-            [...Array(typeList.length)].forEach(() => colors.push("orange"));
+            [...Array(typeList.length)].forEach(() =>
+                colors.push(getColorHex("text-report-string"))
+            );
 
             const typeString = typeList.map((t) => `%c"${t}"%c`).join(", ");
             let message = `%c${event.constructor.name}%c<${typeString}>`;
@@ -930,12 +984,12 @@ function setupEvents(type, options) {
             const target = event.__originalTarget || event.target;
             if (isNode(target)) {
                 const targetParts = toSelector(target, { object: true });
-                colors.push("blue");
+                colors.push(getColorHex("text-report-html-tag"));
                 if (targetParts.id) {
-                    colors.push("orange");
+                    colors.push(getColorHex("text-report-html-id"));
                 }
                 if (targetParts.class) {
-                    colors.push("lightBlue");
+                    colors.push(getColorHex("text-report-html-class"));
                 }
                 const targetString = $values(targetParts)
                     .map((part) => `%c${part}%c`)
@@ -943,8 +997,8 @@ function setupEvents(type, options) {
                 message += ` @${targetString}`;
             }
             const messageColors = colors.flatMap((color) => [
-                `color: ${LOG_COLORS[color]}; font-weight: normal`,
-                `color: ${LOG_COLORS.reset}`,
+                `color: ${color}; font-weight: normal`,
+                "",
             ]);
 
             $groupCollapsed(message, ...messageColors);
@@ -976,6 +1030,16 @@ function toEventPosition(clientX, clientY, position) {
     };
 }
 
+async function triggerChange() {
+    const target = runTime.changeTarget;
+    const hasValueChanged = runTime.initialValue !== target.value;
+    runTime.initialValue = null;
+    removeChangeTargetListeners();
+    if (target && hasValueChanged) {
+        return _dispatch(target, "change");
+    }
+}
+
 /**
  * @param {EventTarget} target
  * @param {PointerEventInit} pointerInit
@@ -985,7 +1049,7 @@ async function triggerClick(target, pointerInit) {
         return;
     }
     const eventType = (pointerInit.button ?? 0) === btn.LEFT ? "click" : "auxclick";
-    const clickEvent = await dispatch(target, eventType, pointerInit);
+    const clickEvent = await _dispatch(target, eventType, pointerInit);
     if (isPrevented(clickEvent)) {
         return;
     }
@@ -1014,7 +1078,7 @@ async function triggerClick(target, pointerInit) {
                  */
                 const parent = target.parentElement;
                 if (parent && getTag(parent) === "select") {
-                    await dispatch(parent, "change");
+                    await _dispatch(parent, "change");
                 }
                 break;
             }
@@ -1027,9 +1091,9 @@ async function triggerClick(target, pointerInit) {
  * @param {DragEventInit} eventInit
  */
 async function triggerDrag(target, eventInit) {
-    await dispatch(target, "drag", eventInit);
+    await _dispatch(target, "drag", eventInit);
     // Only "dragover" being prevented is taken into account for "drop" events
-    const dragOverEvent = await dispatch(target, "dragover", eventInit);
+    const dragOverEvent = await _dispatch(target, "dragover", eventInit);
     return isPrevented(dragOverEvent);
 }
 
@@ -1042,10 +1106,13 @@ async function triggerFocus(target) {
         return;
     }
     if (previous !== target.ownerDocument.body) {
+        if (runTime.changeTarget) {
+            await triggerChange();
+        }
         await dispatchAndIgnore({
             target: previous,
             events: ["blur", "focusout"],
-            callback: (el) => el.blur(),
+            callback: $blur.bind(previous),
             options: { relatedTarget: target },
         });
     }
@@ -1055,7 +1122,7 @@ async function triggerFocus(target) {
             target,
             events: ["focus", "focusin"],
             additionalEvents: ["select"],
-            callback: (el) => el.focus(),
+            callback: $focus.bind(target),
             options: { relatedTarget: previous },
         });
         if (previousSelection && previousSelection === getStringSelection(target)) {
@@ -1065,22 +1132,17 @@ async function triggerFocus(target) {
 }
 
 /**
- * @param {EventTarget} target
+ * @param {Resolver<EventTarget>} targetResolver
  * @param {FillOptions} [options]
  */
-async function _clear(target, options) {
-    // Inputs and text areas
-    const initialValue = target.value;
-
+async function _clear(targetResolver, options) {
     // Simulates 2 key presses:
     // - Control + A: selects all the text
     // - Backspace: deletes the text
-    fullClear = true;
-    await _press(target, { ctrlKey: true, key: "a" });
-    await _press(target, { key: "Backspace" });
-    fullClear = false;
+    await _press(targetResolver, { ctrlKey: true, key: "a" });
+    await _press(targetResolver, { key: "Backspace" }, { fullClear: true });
 
-    await registerForChange(target, initialValue, options?.confirm);
+    await registerForChange(resolve(targetResolver), options?.confirm);
 }
 
 /**
@@ -1092,31 +1154,77 @@ async function _click(options) {
 }
 
 /**
+ * @template {EventType} T
+ * @template {HTMLBodyElementEventMap[T]} I
  * @param {EventTarget} target
+ * @param {T} type
+ * @param {Partial<I> | { eventInit: Record<T, Partial<I>> }} [eventInit]
+ * @returns {Promise<I>}
+ */
+async function _dispatch(target, type, eventInit) {
+    eventInit = { ...eventInit, ...currentEventInit[type] };
+    for (const key in eventInit) {
+        if (key in DEPRECATED_EVENT_PROPERTIES) {
+            throw new HootInteractionError(
+                `cannot dispatch "${type}" event: property "${key}" is deprecated, use "${DEPRECATED_EVENT_PROPERTIES[key]}" instead`
+            );
+        }
+    }
+
+    const [Constructor, processParams, flags] = getEventConstructor(type);
+    const params = processParams({
+        composed: true,
+        ...eventInit,
+        target,
+        type,
+    });
+    if (flags & BUBBLES) {
+        params.bubbles = true;
+    }
+    if (flags & CANCELABLE) {
+        params.cancelable = true;
+    }
+    if (flags & VIEW) {
+        params.view ||= getWindow(target);
+    }
+    const event = new Constructor(type, params);
+
+    target.dispatchEvent(event);
+
+    await Promise.resolve();
+
+    getCurrentEvents().push(event);
+
+    return event;
+}
+
+/**
+ * @param {Resolver<EventTarget>} targetResolver
  * @param {InputValue} value
  * @param {FillOptions} [options]
  */
-async function _fill(target, value, options) {
-    const initialValue = target.value;
+async function _fill(targetResolver, value, options) {
+    const initialTarget = resolve(targetResolver);
 
-    if (getTag(target) === "input") {
-        switch (target.type) {
-            case "color": {
-                target.value = String(value);
-                await dispatch(target, "input");
-                await dispatch(target, "change");
+    if (getTag(initialTarget) === "input") {
+        switch (initialTarget.type) {
+            case "color":
+            case "time": {
+                initialTarget.value = String(value);
+                await _dispatch(initialTarget, "input");
+                await _dispatch(initialTarget, "change");
                 return;
             }
             case "file": {
                 const files = ensureArray(value);
-                if (files.length > 1 && !target.multiple) {
+                if (files.length > 1 && !initialTarget.multiple) {
                     throw new HootInteractionError(
                         `input[type="file"] does not support multiple files`
                     );
                 }
-                target.files = createDataTransfer({ files }).files;
+                initialTarget.files = createDataTransfer({ files }).files;
 
-                await dispatch(target, "change");
+                await _dispatch(initialTarget, "change");
                 return;
             }
             case "range": {
@@ -1125,9 +1233,9 @@ async function _fill(target, value, options) {
                     throw new TypeError(`input[type="range"] only accept 'number' values`);
                 }
 
-                target.value = String(numberValue);
-                await dispatch(target, "input");
-                await dispatch(target, "change");
+                initialTarget.value = String(numberValue);
+                await _dispatch(initialTarget, "input");
+                await _dispatch(initialTarget, "change");
                 return;
             }
         }
@@ -1136,34 +1244,34 @@ async function _fill(target, value, options) {
     if (options?.instantly) {
         // Simulates filling the clipboard with the value (can be from external source)
         globalThis.navigator.clipboard.writeText(value).catch();
-        await _press(target, { ctrlKey: true, key: "v" });
+        await _press(targetResolver, { ctrlKey: true, key: "v" });
     } else {
         if (options?.composition) {
             runTime.isComposing = true;
             // Simulates the start of a composition
-            await dispatch(target, "compositionstart");
+            await _dispatch(initialTarget, "compositionstart");
         }
         for (const char of String(value)) {
             const key = char.toLowerCase();
-            await _press(target, { key, shiftKey: key !== char });
+            await _press(targetResolver, { key, shiftKey: key !== char });
         }
         if (options?.composition) {
             runTime.isComposing = false;
             // Simulates the end of a composition
-            await dispatch(target, "compositionend");
+            await _dispatch(initialTarget, "compositionend");
         }
     }
 
-    await registerForChange(target, initialValue, options?.confirm);
+    await registerForChange(resolve(targetResolver), options?.confirm);
 }
 
 /**
  * @param {EventTarget | null} target
  * @param {PointerOptions | null} options
- * @param {{ implicit?: boolean }} [hoverOptions]
+ * @param {{ implicit?: boolean, originalTarget: AsyncTarget }} hoverOptions
  */
 async function _hover(target, options, hoverOptions) {
-    const pointerTarget = target && getPointerTarget(target, options);
+    const pointerTarget = getPointerTarget(target, options, hoverOptions.originalTarget);
     const position = target && getPosition(target, options);
 
     const previousPT = runTime.pointerTarget;
@@ -1182,7 +1290,7 @@ async function _hover(target, options, hoverOptions) {
          *  On: unprevented 'pointerdown' on a draggable element (DESKTOP ONLY)
          *  Do: triggers a 'dragstart' event
          */
-        const dragStartEvent = await dispatch(previousPT, "dragstart", {
+        const dragStartEvent = await _dispatch(previousPT, "dragstart", {
             dataTransfer: runTime.dataTransfer,
         });
 
@@ -1209,7 +1317,7 @@ async function _hover(target, options, hoverOptions) {
             // If dragging, only drag events are triggered
             const leaveEventInitWithDT = { ...leaveEventInit, dataTransfer: runTime.dataTransfer };
             runTime.lastDragOverCancelled = await triggerDrag(previousPT, leaveEventInitWithDT);
-            await dispatch(previousPT, "dragleave", leaveEventInitWithDT);
+            await _dispatch(previousPT, "dragleave", leaveEventInitWithDT);
         } else {
             // Regular case: pointer events are triggered
             await dispatchPointerEvent(previousPT, "pointermove", leaveEventInit, {
@@ -1221,7 +1329,7 @@ async function _hover(target, options, hoverOptions) {
             });
             const leaveEvents = await Promise.all(
                 getDifferentParents(pointerTarget, previousPT).map((element) =>
-                    dispatch(element, "pointerleave", leaveEventInit)
+                    _dispatch(element, "pointerleave", leaveEventInit)
                 )
             );
             if (!hasTouch()) {
@@ -1244,7 +1352,11 @@ async function _hover(target, options, hoverOptions) {
         const enterEventInitWithDT = { ...enterEventInit, dataTransfer: runTime.dataTransfer };
         runTime.lastDragOverCancelled = false;
         if (isDifferentTarget) {
-            const dragEnterEvent = await dispatch(pointerTarget, "dragenter", enterEventInitWithDT);
+            const dragEnterEvent = await _dispatch(
+                pointerTarget,
+                "dragenter",
+                enterEventInitWithDT
+            );
             runTime.lastDragOverCancelled = isPrevented(dragEnterEvent);
         }
         runTime.lastDragOverCancelled ||= await triggerDrag(pointerTarget, enterEventInitWithDT);
@@ -1256,7 +1368,7 @@ async function _hover(target, options, hoverOptions) {
             });
             const enterEvents = await Promise.all(
                 getDifferentParents(previousPT, pointerTarget).map((element) =>
-                    dispatch(element, "pointerenter", enterEventInit)
+                    _dispatch(element, "pointerenter", enterEventInit)
                 )
             );
             if (!hasTouch()) {
@@ -1271,17 +1383,22 @@ async function _hover(target, options, hoverOptions) {
 }
 
 /**
- * @param {EventTarget} target
+ * @param {Resolver<EventTarget>} targetResolver
  * @param {KeyboardEventInit} eventInit
+ * @param {KeyDownOptions} [options]
  */
-async function _keyDown(target, eventInit) {
+async function _keyDown(targetResolver, eventInit, options) {
     eventInit = { ...eventInit, ...currentEventInit.keydown };
     registerSpecialKey(eventInit, true);
 
+    const keyDownTarget = resolve(targetResolver);
     const repeat =
         typeof eventInit.repeat === "boolean" ? eventInit.repeat : runTime.key === eventInit.key;
     runTime.key = eventInit.key;
-    const keyDownEvent = await dispatch(target, "keydown", { ...eventInit, repeat });
+    const keyDownEvent = await _dispatch(keyDownTarget, "keydown", {
+        ...eventInit,
+        repeat,
+    });
 
     if (isPrevented(keyDownEvent)) {
         return;
@@ -1291,11 +1408,12 @@ async function _keyDown(target, eventInit) {
      * @param {string} toInsert
      * @param {string} type
      */
-    const insertValue = (toInsert, type) => {
-        const { selectionStart, selectionEnd, value } = target;
+    function insertValue(toInsert, type) {
+        const { selectionStart, selectionEnd, value } = inputTarget;
         inputData = toInsert;
         inputType = type;
         if (isNil(selectionStart) && isNil(selectionEnd)) {
+            nextValue ||= inputTarget.value;
             nextValue += toInsert;
         } else {
             nextValue = value.slice(0, selectionStart) + toInsert + value.slice(selectionEnd);
@@ -1303,24 +1421,30 @@ async function _keyDown(target, eventInit) {
                 nextSelectionStart = nextSelectionEnd = selectionStart + 1;
             }
         }
-    };
+    }
 
     const { ctrlKey, key, shiftKey } = keyDownEvent;
-    const initialValue = target.value;
+    const inputTarget = resolve(targetResolver);
     let inputData = null;
     let inputType = null;
     let nextSelectionEnd = null;
     let nextSelectionStart = null;
-    let nextValue = initialValue;
+    let nextValue = null;
     let triggerSelect = false;
 
-    if (isEditable(target)) {
+    if (runTime.initialValue === null || keyDownTarget !== inputTarget) {
+        // If the 'keydown' event changes the target:
+        //  -> initial value needs to be re-evaluated from the new target
+        runTime.initialValue = inputTarget.value;
+    }
+
+    if (isEditable(inputTarget)) {
         switch (key) {
             case "ArrowDown":
             case "ArrowLeft":
             case "ArrowUp":
             case "ArrowRight": {
-                const { selectionStart, selectionEnd, value } = target;
+                const { selectionStart, selectionEnd, value } = inputTarget;
                 if (isNil(selectionStart) || isNil(selectionEnd)) {
                     break;
                 }
@@ -1341,9 +1465,11 @@ async function _keyDown(target, eventInit) {
                 break;
             }
             case "Backspace": {
-                const { selectionStart, selectionEnd, value } = target;
-                if (fullClear) {
-                    // Remove all characters
+                const { selectionStart, selectionEnd, value } = inputTarget;
+                if (options?.fullClear) {
+                    // Remove all characters, regardless of the selection. This
+                    // is to be used to ensure that an input without selection properties
+                    // (e.g. input[type="number"]) can still be properly cleared.
                     nextValue = "";
                 } else if (isNil(selectionStart) || isNil(selectionEnd)) {
                     // Remove last character
@@ -1353,17 +1479,14 @@ async function _keyDown(target, eventInit) {
                     nextValue = value.slice(0, selectionStart - 1) + value.slice(selectionEnd);
                 } else {
                     // Remove current selection from target value
-                    nextValue = deleteSelection(target);
+                    nextValue = deleteSelection(inputTarget);
                 }
                 inputType = "deleteContentBackward";
                 break;
             }
             case "Delete": {
-                const { selectionStart, selectionEnd, value } = target;
-                if (fullClear) {
-                    // Remove all characters
-                    nextValue = "";
-                } else if (isNil(selectionStart) || isNil(selectionEnd)) {
+                const { selectionStart, selectionEnd, value } = inputTarget;
+                if (isNil(selectionStart) || isNil(selectionEnd)) {
                     // Remove first character
                     nextValue = value.slice(1);
                 } else if (selectionStart === selectionEnd) {
@@ -1371,16 +1494,9 @@ async function _keyDown(target, eventInit) {
                     nextValue = value.slice(0, selectionStart) + value.slice(selectionEnd + 1);
                 } else {
                     // Remove current selection from target value
-                    nextValue = deleteSelection(target);
+                    nextValue = deleteSelection(inputTarget);
                 }
                 inputType = "deleteContentForward";
-                break;
-            }
-            case "Enter": {
-                if (target.tagName === "TEXTAREA") {
-                    // Insert new line
-                    insertValue("\n", "insertLineBreak");
-                }
                 break;
             }
             default: {
@@ -1400,14 +1516,14 @@ async function _keyDown(target, eventInit) {
         case "a": {
             if (ctrlKey) {
                 // Select all
-                if (isEditable(target)) {
+                if (isEditable(inputTarget)) {
                     nextSelectionStart = 0;
-                    nextSelectionEnd = target.value.length;
+                    nextSelectionEnd = inputTarget.value.length;
                     triggerSelect = true;
                 } else {
                     const selection = globalThis.getSelection();
                     const range = $createRange();
-                    range.selectNodeContents(target);
+                    range.selectNodeContents(inputTarget);
                     selection.removeAllRanges();
                     selection.addRange(range);
                 }
@@ -1426,31 +1542,40 @@ async function _keyDown(target, eventInit) {
                 globalThis.navigator.clipboard.writeText(text).catch();
 
                 runTime.clipboardData = createDataTransfer(eventInit);
-                await dispatch(target, "copy", { clipboardData: runTime.clipboardData });
+                await _dispatch(inputTarget, "copy", { clipboardData: runTime.clipboardData });
             }
             break;
         }
         case "Enter": {
-            const tag = getTag(target);
-            const parentForm = target.closest("form");
-            if (parentForm && target.type !== "button") {
+            if (runTime.changeTarget) {
+                await triggerChange();
+            }
+            if (inputTarget.tagName === "TEXTAREA" && isEditable(inputTarget)) {
+                // Insert new line
+                insertValue("\n", "insertLineBreak");
+            }
+            const tag = getTag(inputTarget);
+            const parentForm = inputTarget.closest("form");
+            if (parentForm && inputTarget.type !== "button") {
                 /**
                  * Special action: <form> 'Enter'
                  *  On: unprevented 'Enter' keydown on any element that
                  *      is not a <button type="button"/> in a form element
                  *  Do: triggers a 'submit' event on the form
                  */
-                await dispatch(parentForm, "submit");
+                await _dispatch(parentForm, "submit");
             } else if (
                 !keyDownEvent.repeat &&
-                (tag === "a" || tag === "button" || (tag === "input" && target.type === "button"))
+                (tag === "a" ||
+                    tag === "button" ||
+                    (tag === "input" && inputTarget.type === "button"))
             ) {
                 /**
                  * Special action: <a>, <button> or <input type="button"> 'Enter'
                  *  On: unprevented and unrepeated 'Enter' keydown on mentioned elements
                  *  Do: triggers a 'click' event on the element
                  */
-                await dispatch(target, "click", { button: btn.LEFT });
+                await _dispatch(inputTarget, "click", { button: btn.LEFT });
             }
             break;
         }
@@ -1479,14 +1604,16 @@ async function _keyDown(target, eventInit) {
          *  Do: paste current clipboard content to current element
          */
         case "v": {
-            if (ctrlKey && isEditable(target)) {
+            if (ctrlKey && isEditable(inputTarget)) {
                 // Set target value (if possible)
                 try {
                     nextValue = await globalThis.navigator.clipboard.readText();
-                } catch (err) {}
+                } catch {
+                    // Ignore clipboard errors
+                }
                 inputType = "insertFromPaste";
 
-                await dispatch(target, "paste", {
+                await _dispatch(inputTarget, "paste", {
                     clipboardData: runTime.clipboardData || createDataTransfer(eventInit),
                 });
                 runTime.clipboardData = null;
@@ -1499,59 +1626,64 @@ async function _keyDown(target, eventInit) {
          *  Do: cut current selection to clipboard and remove selection
          */
         case "x": {
-            if (ctrlKey && isEditable(target)) {
+            if (ctrlKey && isEditable(inputTarget)) {
                 // Get selection from window
                 const text = globalThis.getSelection().toString();
                 globalThis.navigator.clipboard.writeText(text).catch();
 
-                nextValue = deleteSelection(target);
+                nextValue = deleteSelection(inputTarget);
                 inputType = "deleteByCut";
 
                 runTime.clipboardData = createDataTransfer(eventInit);
-                await dispatch(target, "cut", { clipboardData: runTime.clipboardData });
+                await _dispatch(inputTarget, "cut", { clipboardData: runTime.clipboardData });
             }
             break;
         }
     }
 
-    if (initialValue !== nextValue) {
-        target.value = nextValue;
+    if (nextValue !== null) {
+        inputTarget.value = nextValue;
         const inputEventInit = {
             data: inputData,
             inputType,
         };
-        const beforeInputEvent = await dispatch(target, "beforeinput", inputEventInit);
+        const beforeInputEvent = await _dispatch(inputTarget, "beforeinput", inputEventInit);
         if (!isPrevented(beforeInputEvent)) {
-            await dispatch(target, "input", inputEventInit);
+            await _dispatch(inputTarget, "input", inputEventInit);
         }
     }
-    changeSelection(target, nextSelectionStart, nextSelectionEnd);
+    changeSelection(inputTarget, nextSelectionStart, nextSelectionEnd);
     if (triggerSelect) {
         await dispatchAndIgnore({
-            target,
+            target: inputTarget,
             events: ["select"],
         });
     }
 }
 
 /**
- * @param {EventTarget} target
+ * @param {Resolver<EventTarget>} targetResolver
  * @param {KeyboardEventInit} eventInit
  */
-async function _keyUp(target, eventInit) {
+async function _keyUp(targetResolver, eventInit) {
     eventInit = { ...eventInit, ...currentEventInit.keyup };
-    await dispatch(target, "keyup", eventInit);
+    await _dispatch(resolve(targetResolver), "keyup", eventInit);
 
     runTime.key = null;
     registerSpecialKey(eventInit, false);
 
-    if (eventInit.key === " " && getTag(target) === "input" && target.type === "checkbox") {
+    const finalTarget = resolve(targetResolver);
+    if (
+        eventInit.key === " " &&
+        getTag(finalTarget) === "input" &&
+        finalTarget.type === "checkbox"
+    ) {
         /**
          * Special action: input[type=checkbox] 'Space'
          *  On: unprevented ' ' keydown on an <input type="checkbox"/>
          *  Do: triggers a 'click' event on the input
          */
-        await triggerClick(target, { button: btn.LEFT });
+        await triggerClick(finalTarget, { button: btn.LEFT });
     }
 }
 
@@ -1559,7 +1691,7 @@ async function _keyUp(target, eventInit) {
  * @param {DragOptions} [options]
  */
 async function _pointerDown(options) {
-    setPointerDownTarget(runTime.pointerTarget);
+    setPointerDownTarget(runTime.pointerTarget, options);
 
     if (options?.dataTransfer || options?.files || options?.items) {
         runTime.dataTransfer = createDataTransfer(options);
@@ -1608,7 +1740,7 @@ async function _pointerDown(options) {
          *      event on an element
          *  Do: triggers a 'contextmenu' event
          */
-        await dispatch(pointerDownTarget, "contextmenu", eventInit);
+        await _dispatch(pointerDownTarget, "contextmenu", eventInit);
     }
 }
 
@@ -1619,6 +1751,7 @@ async function _pointerUp(options) {
     const target = runTime.pointerTarget;
     const isLongTap = globalThis.Date.now() - runTime.touchStartTimeOffset > LONG_TAP_DELAY;
     const pointerDownTarget = runTime.pointerDownTarget;
+    const pointerUpTarget = getPointerTarget(target, options);
     const eventInit = {
         ...runTime.position,
         ...currentEventInit.pointerup,
@@ -1638,10 +1771,10 @@ async function _pointerUp(options) {
              * - On: pointer up after a prevented 'dragover' or 'dragenter'
              * - Do: triggers a 'drop' event on the target
              */
-            await dispatch(target, "drop", eventInitWithDT);
+            await _dispatch(pointerUpTarget, "drop", eventInitWithDT);
         }
 
-        await dispatch(target, "dragend", eventInitWithDT);
+        await _dispatch(pointerUpTarget, "dragend", eventInitWithDT);
         return;
     }
 
@@ -1649,8 +1782,8 @@ async function _pointerUp(options) {
         ...eventInit,
         detail: runTime.clickCount + 1,
     };
-    await dispatchPointerEvent(target, "pointerup", eventInit, {
-        mouse: !target.disabled && ["mouseup", mouseEventInit],
+    await dispatchPointerEvent(pointerUpTarget, "pointerup", eventInit, {
+        mouse: !pointerUpTarget.disabled && ["mouseup", mouseEventInit],
         touch: ["touchend"],
     });
 
@@ -1666,21 +1799,21 @@ async function _pointerUp(options) {
 
     let clickTarget;
     if (hasTouch()) {
-        clickTarget = pointerDownTarget === target && target;
+        clickTarget = pointerDownTarget === pointerUpTarget && pointerUpTarget;
     } else {
-        clickTarget = getFirstCommonParent(target, pointerDownTarget);
+        clickTarget = getFirstCommonParent(pointerUpTarget, pointerDownTarget);
     }
     if (clickTarget) {
         await triggerClick(clickTarget, mouseEventInit);
         if (mouseEventInit.button === btn.LEFT) {
             runTime.clickCount++;
             if (!hasTouch() && runTime.clickCount % 2 === 0) {
-                await dispatch(clickTarget, "dblclick", mouseEventInit);
+                await _dispatch(clickTarget, "dblclick", mouseEventInit);
             }
         }
     }
 
-    setPointerDownTarget(null);
+    setPointerDownTarget(null, options);
     if (runTime.pointerDownTimeout) {
         globalThis.clearTimeout(runTime.pointerDownTimeout);
     }
@@ -1693,12 +1826,13 @@ async function _pointerUp(options) {
 }
 
 /**
- * @param {EventTarget} target
+ * @param {Resolver<EventTarget>} targetResolver
  * @param {KeyboardEventInit} eventInit
+ * @param {KeyDownOptions} [options]
  */
-async function _press(target, eventInit) {
-    await _keyDown(target, eventInit);
-    await _keyUp(target, eventInit);
+async function _press(targetResolver, eventInit, options) {
+    await _keyDown(targetResolver, eventInit, options);
+    await _keyUp(targetResolver, eventInit);
 }
 
 /**
@@ -1706,7 +1840,7 @@ async function _press(target, eventInit) {
  * @param {string | number | (string | number)[]} value
  */
 async function _select(target, value) {
-    const values = ensureArray(value).map(String);
+    const values = ensureArray(value, String);
     let found = false;
     for (const option of target.options) {
         option.selected = values.includes(option.value);
@@ -1719,7 +1853,7 @@ async function _select(target, value) {
             `error when calling \`select()\`: no option found with value "${values.join(", ")}"`
         );
     }
-    await dispatch(target, "change");
+    await _dispatch(target, "change");
 }
 
 class HootInteractionError extends Error {
@@ -1801,12 +1935,6 @@ const KEY_ALIASES = {
     up: "ArrowUp",
     win: "Meta",
 };
-const LOG_COLORS = {
-    blue: "#5db0d7",
-    orange: "#f29364",
-    lightBlue: "#9bbbdc",
-    reset: "inherit",
-};
 const LONG_TAP_DELAY = 500;
 
 /** @type {Record<string, Event[]>} */
@@ -1815,13 +1943,7 @@ const currentEvents = $create(null);
 const currentEventInit = $create(null);
 /** @type {string[]} */
 const currentEventTypes = [];
-/** @type {(() => Promise<void>) | null} */
-let afterNextDispatch = null;
 let allowLogs = false;
-let fullClear = false;
-
-// Keyboard global variables
-const changeTargetListeners = [];
 
 // Other global variables
 const runTime = getDefaultRunTimeValue();
@@ -1842,7 +1964,9 @@ const VIEW = 0b100;
  * - cannot be canceled
  * @param {FullEventInit} eventInit
  */
-const mapEvent = (eventInit) => eventInit;
+function mapEvent(eventInit) {
+    return eventInit;
+}
 
 // Pointer, mouse & wheel event mappers
 // ------------------------------------
@@ -1850,34 +1974,41 @@ const mapEvent = (eventInit) => eventInit;
 /**
  * @param {FullEventInit<MouseEventInit>} eventInit
  */
-const mapMouseEvent = (eventInit) => ({
-    button: -1,
-    buttons: runTime.buttons,
-    clientX: eventInit.clientX ?? eventInit.pageX ?? eventInit.screenX ?? 0,
-    clientY: eventInit.clientY ?? eventInit.pageY ?? eventInit.screenY ?? 0,
-    ...runTime.modifierKeys,
-    ...eventInit,
-});
+function mapMouseEvent(eventInit) {
+    return {
+        button: -1,
+        buttons: runTime.buttons,
+        clientX: eventInit.clientX ?? eventInit.pageX ?? eventInit.screenX ?? 0,
+        clientY: eventInit.clientY ?? eventInit.pageY ?? eventInit.screenY ?? 0,
+        ...runTime.modifierKeys,
+        ...eventInit,
+    };
+}
 
 /**
  * @param {FullEventInit<PointerEventInit>} eventInit
  */
-const mapPointerEvent = (eventInit) => ({
-    ...mapMouseEvent(eventInit),
-    button: btn.LEFT,
-    pointerId: 1,
-    pointerType: hasTouch() ? "touch" : "mouse",
-    ...eventInit,
-});
+function mapPointerEvent(eventInit) {
+    return {
+        ...mapMouseEvent(eventInit),
+        button: btn.LEFT,
+        isPrimary: eventInit?.btn ? eventInit.btn === btn.LEFT : true,
+        pointerId: 1,
+        pointerType: hasTouch() ? "touch" : "mouse",
+        ...eventInit,
+    };
+}
 
 /**
  * @param {FullEventInit<WheelEventInit>} eventInit
  */
-const mapWheelEvent = (eventInit) => ({
-    ...mapMouseEvent(eventInit),
-    button: btn.LEFT,
-    ...eventInit,
-});
+function mapWheelEvent(eventInit) {
+    return {
+        ...mapMouseEvent(eventInit),
+        button: btn.LEFT,
+        ...eventInit,
+    };
+}
 
 // Touch event mappers
 // -------------------
@@ -1885,7 +2016,7 @@ const mapWheelEvent = (eventInit) => ({
 /**
  * @param {FullEventInit<TouchEventInit>} eventInit
  */
-const mapTouchEvent = (eventInit) => {
+function mapTouchEvent(eventInit) {
     const touches = eventInit.targetTouches ||
         eventInit.touches || [new Touch({ identifier: 0, ...eventInit })];
     return {
@@ -1895,7 +2026,7 @@ const mapTouchEvent = (eventInit) => {
         targetTouches: eventInit.targetTouches || touches,
         touches: eventInit.touches || (eventInit.type === "touchend" ? [] : touches),
     };
-};
+}
 
 // Keyboard & input event mappers
 // ------------------------------
@@ -1903,20 +2034,24 @@ const mapTouchEvent = (eventInit) => {
 /**
  * @param {FullEventInit<InputEventInit>} eventInit
  */
-const mapInputEvent = (eventInit) => ({
-    data: null,
-    isComposing: !!runTime.isComposing,
-    ...eventInit,
-});
+function mapInputEvent(eventInit) {
+    return {
+        data: null,
+        isComposing: !!runTime.isComposing,
+        ...eventInit,
+    };
+}
 
 /**
  * @param {FullEventInit<KeyboardEventInit>} eventInit
  */
-const mapKeyboardEvent = (eventInit) => ({
-    isComposing: !!runTime.isComposing,
-    ...runTime.modifierKeys,
-    ...eventInit,
-});
+function mapKeyboardEvent(eventInit) {
+    return {
+        isComposing: !!runTime.isComposing,
+        ...runTime.modifierKeys,
+        ...eventInit,
+    };
+}
 
 //-----------------------------------------------------------------------------
 // Exports
@@ -1946,7 +2081,7 @@ export async function check(target, options) {
 
     const checkTarget = getTag(element) === "label" ? element.control : element;
     if (!checkTarget.checked) {
-        await _hover(element, options, { implicit: true });
+        await _hover(element, options, { implicit: true, originalTarget: target });
         await _click(options);
 
         if (!checkTarget.checked) {
@@ -1985,19 +2120,19 @@ export function cleanupEvents() {
  */
 export async function clear(options) {
     const finalizeEvents = setupEvents("clear", options);
-    const element = getActiveElement();
+    const activeElement = getActiveElement();
 
-    if (!hasTagName(element, "select") && !isEditable(element)) {
+    if (!hasTagName(activeElement, "select") && !isEditable(activeElement)) {
         throw new HootInteractionError(
             `cannot call \`clear()\`: target should be editable or a <select> element`
         );
     }
 
-    if (isEditable(element)) {
-        await _clear(element, options);
+    if (isEditable(activeElement)) {
+        await _clear(getActiveElement, options);
     } else {
         // Selects
-        await _select(element, "");
+        await _select(activeElement, "");
     }
 
     return finalizeEvents();
@@ -2028,7 +2163,7 @@ export async function click(target, options) {
     const finalizeEvents = setupEvents("click", options);
     const element = queryAny(await target, options);
 
-    await _hover(element, options, { implicit: true });
+    await _hover(element, options, { implicit: true, originalTarget: target });
     await _click(options);
 
     return finalizeEvents();
@@ -2049,7 +2184,7 @@ export async function dblclick(target, options) {
     const element = queryAny(await target, options);
 
     options = { ...options, button: btn.LEFT };
-    await _hover(element, options, { implicit: true });
+    await _hover(element, options, { implicit: true, originalTarget: target });
     await _click(options);
     await _click(options);
 
@@ -2057,6 +2192,10 @@ export async function dblclick(target, options) {
 }
 
 /**
+ * Disclaimer: avoid using this method; it is meant to support niche event sequences,
+ * or as a temporary fix for unsupported use cases. Prefer using other 'hoot-dom'
+ * helpers such as {@link click}, {@link press} or {@link edit}.
+ *
  * Creates a new DOM {@link Event} of the given type and dispatches it on the given
  * {@link Target}.
  *
@@ -2070,10 +2209,17 @@ export async function dblclick(target, options) {
  * @param {T} type
  * @param {Partial<I> | { eventInit: Record<T, Partial<I>> }} [eventInit]
  * @example
- *  await dispatch(document.querySelector("input"), "paste"); // Dispatches a "paste" event on the given <input>
- * @returns {Promise<I>}
+ *  await manuallyDispatchProgrammaticEvent("input", "paste"); // Dispatches a "paste" event on the given <input>
+ * @returns {Promise<EventList>}
  */
 export async function dispatch(target, type, eventInit) {
+    const finalizeEvents = setupEvents("dispatch");
+
+    if (!isEventTarget(target)) {
+        throw new HootInteractionError(
+            `cannot dispatch "${type}" event: expected target to be an 'EventTarget', got: ${target}`
+        );
+    }
     if (type in DEPRECATED_EVENTS) {
         throw new HootInteractionError(
             `cannot dispatch "${type}" event: this event type is deprecated, use "${DEPRECATED_EVENTS[type]}" instead`
@@ -2084,45 +2230,10 @@ export async function dispatch(target, type, eventInit) {
             `cannot dispatch "${type}" event: this event type is either non-standard or deprecated`
         );
     }
-    eventInit = { ...eventInit, ...currentEventInit[type] };
-    for (const key in eventInit) {
-        if (key in DEPRECATED_EVENT_PROPERTIES) {
-            throw new HootInteractionError(
-                `cannot dispatch "${type}" event: property "${key}" is deprecated, use "${DEPRECATED_EVENT_PROPERTIES[key]}" instead`
-            );
-        }
-    }
 
-    const [Constructor, processParams, flags] = getEventConstructor(type);
-    const params = processParams({
-        composed: true,
-        ...eventInit,
-        target,
-        type,
-    });
-    if (flags & BUBBLES) {
-        params.bubbles = true;
-    }
-    if (flags & CANCELABLE) {
-        params.cancelable = true;
-    }
-    if (flags & VIEW) {
-        params.view ||= getWindow(target);
-    }
-    const event = new Constructor(type, params);
+    await _dispatch(target, type, eventInit);
 
-    target.dispatchEvent(event);
-    await Promise.resolve();
-
-    getCurrentEvents().push(event);
-
-    if (afterNextDispatch) {
-        const callback = afterNextDispatch;
-        afterNextDispatch = null;
-        await microTick().then(callback);
-    }
-
-    return event;
+    return finalizeEvents();
 }
 
 /**
@@ -2152,7 +2263,7 @@ export async function drag(target, options) {
      * @param {boolean} endDrag
      * @returns {T}
      */
-    const expectIsDragging = (fn, endDrag) => {
+    function expectIsDragging(fn, endDrag) {
         return {
             async [fn.name](...args) {
                 if (dragEndReason) {
@@ -2167,7 +2278,7 @@ export async function drag(target, options) {
                 return result;
             },
         }[fn.name];
-    };
+    }
 
     const cancel = expectIsDragging(
         /** @type {DragHelpers["cancel"]} */
@@ -2218,7 +2329,7 @@ export async function drag(target, options) {
             const finalizeEvents = setupEvents("drag & drop: move", options);
 
             const nextElement = to ? queryAny(await to, options) : runTime.pointerTarget;
-            await _hover(nextElement, options);
+            await _hover(nextElement, options, { originalTarget: to });
 
             dragEvents.push(...finalizeEvents());
 
@@ -2233,7 +2344,7 @@ export async function drag(target, options) {
     let dragEndReason = null;
 
     // Pointer down on main target
-    await _hover(dragStartTarget, options, { implicit: true });
+    await _hover(dragStartTarget, options, { implicit: true, originalTarget: target });
     await _pointerDown(options);
 
     const dragEvents = finalizeEvents();
@@ -2257,15 +2368,15 @@ export async function drag(target, options) {
  */
 export async function edit(value, options) {
     const finalizeEvents = setupEvents("edit", options);
-    const element = getActiveElement();
-    if (!isEditable(element)) {
+    const activeElement = getActiveElement();
+    if (!isEditable(activeElement)) {
         throw new HootInteractionError(`cannot call \`edit()\`: target should be editable`);
     }
 
-    if (getNodeValue(element)) {
-        await _clear(element);
+    if (getNodeValue(activeElement)) {
+        await _clear(getActiveElement);
     }
-    await _fill(element, value, options);
+    await _fill(getActiveElement, value, options);
 
     return finalizeEvents();
 }
@@ -2304,13 +2415,12 @@ export function enableEventLogs(toggle) {
  */
 export async function fill(value, options) {
     const finalizeEvents = setupEvents("fill", options);
-    const element = getActiveElement();
 
-    if (!isEditable(element)) {
+    if (!isEditable(getActiveElement())) {
         throw new HootInteractionError(`cannot call \`fill()\`: target should be editable`);
     }
 
-    await _fill(element, value, options);
+    await _fill(getActiveElement, value, options);
 
     return finalizeEvents();
 }
@@ -2337,7 +2447,7 @@ export async function hover(target, options) {
     const finalizeEvents = setupEvents("hover", options);
     const element = queryAny(await target, options);
 
-    await _hover(element, options);
+    await _hover(element, options, { originalTarget: target });
 
     return finalizeEvents();
 }
@@ -2368,7 +2478,7 @@ export async function keyDown(keyStrokes, options) {
     const finalizeEvents = setupEvents("keyDown", options);
     const eventInits = parseKeyStrokes(keyStrokes, options);
     for (const eventInit of eventInits) {
-        await _keyDown(getActiveElement(), eventInit);
+        await _keyDown(getActiveElement, eventInit);
     }
 
     return finalizeEvents();
@@ -2390,7 +2500,7 @@ export async function keyUp(keyStrokes, options) {
     const finalizeEvents = setupEvents("keyUp", options);
     const eventInits = parseKeyStrokes(keyStrokes, options);
     for (const eventInit of eventInits) {
-        await _keyUp(getActiveElement(), eventInit);
+        await _keyUp(getActiveElement, eventInit);
     }
 
     return finalizeEvents();
@@ -2416,7 +2526,7 @@ export async function keyUp(keyStrokes, options) {
 export async function leave(options) {
     const finalizeEvents = setupEvents("leave", options);
 
-    await _hover(null, options);
+    await _hover(null, options, { originalTarget: window });
 
     return finalizeEvents();
 }
@@ -2436,7 +2546,7 @@ export async function middleClick(target, options) {
     const element = queryAny(await target, options);
 
     options = { ...options, button: btn.MIDDLE };
-    await _hover(element, options, { implicit: true });
+    await _hover(element, options, { implicit: true, originalTarget: target });
     await _click(options);
 
     return finalizeEvents();
@@ -2492,7 +2602,7 @@ export async function pointerDown(target, options) {
     const finalizeEvents = setupEvents("pointerDown", options);
     const element = queryAny(await target, options);
 
-    await _hover(element, options, { implicit: true });
+    await _hover(element, options, { implicit: true, originalTarget: target });
     await _pointerDown(options);
 
     return finalizeEvents();
@@ -2516,7 +2626,7 @@ export async function pointerUp(target, options) {
     const finalizeEvents = setupEvents("pointerUp", options);
     const element = queryAny(await target, options);
 
-    await _hover(element, options, { implicit: true });
+    await _hover(element, options, { implicit: true, originalTarget: target });
     await _pointerUp(options);
 
     return finalizeEvents();
@@ -2543,13 +2653,12 @@ export async function pointerUp(target, options) {
 export async function press(keyStrokes, options) {
     const finalizeEvents = setupEvents("press", options);
     const eventInits = parseKeyStrokes(keyStrokes, options);
-    const activeElement = getActiveElement();
 
     for (const eventInit of eventInits) {
-        await _keyDown(activeElement, eventInit);
+        await _keyDown(getActiveElement, eventInit);
     }
     for (const eventInit of eventInits.reverse()) {
-        await _keyUp(activeElement, eventInit);
+        await _keyUp(getActiveElement, eventInit);
     }
 
     return finalizeEvents();
@@ -2576,7 +2685,7 @@ export async function resize(dimensions, options) {
 
     setDimensions(width, height);
 
-    await dispatch(getWindow(), "resize");
+    await _dispatch(getWindow(), "resize");
 
     return finalizeEvents();
 }
@@ -2596,7 +2705,7 @@ export async function rightClick(target, options) {
     const element = queryAny(await target, options);
 
     options = { ...options, button: btn.RIGHT };
-    await _hover(element, options, { implicit: true });
+    await _hover(element, options, { implicit: true, originalTarget: target });
     await _click(options);
 
     return finalizeEvents();
@@ -2669,13 +2778,13 @@ export async function scroll(target, position, options) {
         if (!$isNaN(y)) {
             wheelEventInit.deltaY = y - element.scrollTop;
         }
-        await dispatch(element, "wheel", wheelEventInit);
+        await _dispatch(element, "wheel", wheelEventInit);
     }
     if (force || $values(scrollTopOptions).length) {
         await dispatchAndIgnore({
             target: element,
             events: ["scroll", "scrollend"],
-            callback: (el) => el.scrollTo(scrollTopOptions),
+            callback: () => element.scrollTo(scrollTopOptions),
         });
     }
     if (initiator === "keyboard") {
@@ -2686,8 +2795,8 @@ export async function scroll(target, position, options) {
 }
 
 /**
- * Performs a selection event sequence current **active element**. This helper is
- * intended for `<select>` elements only.
+ * Performs a selection event sequence on the current **active element**. This helper
+ * is intended for `<select>` elements only.
  *
  * The event sequence is as follows:
  *  - `change`
@@ -2701,7 +2810,8 @@ export async function scroll(target, position, options) {
  */
 export async function select(value, options) {
     const finalizeEvents = setupEvents("select", options);
-    const element = options?.target ? queryAny(await options.target) : getActiveElement();
+    const manualTarget = options?.target;
+    const element = manualTarget ? queryAny(await manualTarget) : getActiveElement();
 
     if (!hasTagName(element, "select")) {
         throw new HootInteractionError(
@@ -2709,12 +2819,12 @@ export async function select(value, options) {
         );
     }
 
-    if (options?.target) {
-        await _hover(element, null, { implicit: true });
+    if (manualTarget) {
+        await _hover(element, null, { implicit: true, originalTarget: manualTarget });
         await _pointerDown();
     }
     await _select(element, value);
-    if (options?.target) {
+    if (manualTarget) {
         await _pointerUp();
     }
 
@@ -2763,7 +2873,7 @@ export async function setInputRange(target, value, options) {
     const finalizeEvents = setupEvents("setInputRange", options);
     const element = queryAny(await target, options);
 
-    await _hover(element, options, { implicit: true });
+    await _hover(element, options, { implicit: true, originalTarget: target });
     await _pointerDown(options);
     await _fill(element, value, options);
     await _pointerUp(options);
@@ -2827,7 +2937,7 @@ export async function uncheck(target, options) {
 
     const checkTarget = getTag(element) === "label" ? element.control : element;
     if (checkTarget.checked) {
-        await _hover(element, options, { implicit: true });
+        await _hover(element, options, { implicit: true, originalTarget: target });
         await _click(options);
 
         if (checkTarget.checked) {
@@ -2841,7 +2951,7 @@ export async function uncheck(target, options) {
 }
 
 /**
- * Triggers a "beforeunload" event the current **window**.
+ * Triggers a "beforeunload" event on the current **window**.
  *
  * @param {EventOptions} [options]
  * @returns {Promise<EventList>}
@@ -2849,7 +2959,7 @@ export async function uncheck(target, options) {
 export async function unload(options) {
     const finalizeEvents = setupEvents("unload", options);
 
-    await dispatch(getWindow(), "beforeunload");
+    await _dispatch(getWindow(), "beforeunload");
 
     return finalizeEvents();
 }

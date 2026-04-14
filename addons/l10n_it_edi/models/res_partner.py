@@ -10,7 +10,7 @@ class ResPartner(models.Model):
     _name = 'res.partner'
     _inherit = 'res.partner'
 
-    invoice_edi_format = fields.Selection(selection_add=[('it_edi_xml', 'FatturaPA')])
+    invoice_edi_format = fields.Selection(selection_add=[('it_edi_xml', 'Italy (Factura PA)')])
     l10n_it_pec_email = fields.Char(string="PEC e-mail")
     l10n_it_codice_fiscale = fields.Char(string="Codice Fiscale", size=16)
     l10n_it_pa_index = fields.Char(
@@ -210,3 +210,10 @@ class ResPartner(models.Model):
             return 'it_edi_xml'
         else:
             return res
+
+    def create_company(self):
+        res = super().create_company()
+        if res:
+            it_values = self._update_fields_values(('l10n_it_codice_fiscale', 'l10n_it_pa_index'))
+            self.parent_id.update(it_values)
+        return res

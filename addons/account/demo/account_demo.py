@@ -85,7 +85,7 @@ class AccountChartTemplate(models.AbstractModel):
 
         # the invoice_extract acts like a placeholder for the OCR to be ran and doesn't contain
         # any lines yet
-        for move in invoices.filtered(lambda m: m.state == 'draft'):
+        for move in invoices:
             try:
                 move.action_post()
             except (UserError, ValidationError):
@@ -100,6 +100,7 @@ class AccountChartTemplate(models.AbstractModel):
                 'acc_number': f'BANK{company.id}34567890',
                 'partner_id': company.root_id.partner_id.id,
                 'journal_id': 'bank',
+                'allow_out_payment': True,
             },
         }
 

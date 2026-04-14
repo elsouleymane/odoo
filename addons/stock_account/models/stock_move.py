@@ -73,9 +73,9 @@ class StockMove(models.Model):
                 return {self.env['stock.lot']: price_unit}
         else:
             if self.product_id.lot_valuated:
-                return {lot: lot.standard_price or self.product_id.standard_price for lot in self.lot_ids}
+                return {lot: lot.standard_price or self.product_id.with_company(self.company_id).standard_price for lot in self.lot_ids}
             else:
-                return {self.env['stock.lot']: self.product_id.standard_price}
+                return {self.env['stock.lot']: self.product_id.with_company(self.company_id).standard_price}
 
     @api.model
     def _get_valued_types(self):
@@ -526,6 +526,11 @@ class StockMove(models.Model):
                 if forced_quantity:
                     val['description'] = _('Correction of %s (modification of past move)', move.picking_id.name or move.name)
             svl_vals_list += vals
+        self._round_in_svl_value(svl_vals_list)
+        return svl_vals_list
+
+    @api.model
+    def _round_in_svl_value(self, svl_vals_list):
         return svl_vals_list
 
     def _get_src_account(self, accounts_data):
@@ -757,9 +762,7 @@ class StockMove(models.Model):
                 cost = -1 * cost
                 anglosaxon_am_vals = self.with_company(self.company_id)._prepare_account_move_vals(acc_valuation, acc_dest, journal_id, qty, description, svl_id, cost)
         elif self._is_dropshipped_returned():
-            if cost > 0 and self.location_dest_id._should_be_valued():
-                anglosaxon_am_vals = self.with_company(self.company_id).with_context(is_returned=True)._prepare_account_move_vals(acc_valuation, acc_src, journal_id, qty, description, svl_id, cost)
-            elif cost > 0:
+            if cost > 0:
                 anglosaxon_am_vals = self.with_company(self.company_id).with_context(is_returned=True)._prepare_account_move_vals(acc_dest, acc_valuation, journal_id, qty, description, svl_id, cost)
             else:
                 cost = -1 * cost
@@ -787,3 +790,19 @@ class StockMove(models.Model):
 
     def _get_all_related_sm(self, product):
         return self.filtered(lambda m: m.product_id == product)
+
+    def _get_layer_candidates(self):
+        self.ensure_one()
+        return self.stock_valuation_layer_ids
+
+    def _get_layers_price_diff(self):
+        total_layers_ids = OrderedSet()
+        for move in self:
+            if move._is_dropshipped():
+                layers = move.stock_valuation_layer_ids.filtered(lambda svl: svl.quantity > 0)
+            elif move._is_dropshipped_returned():
+                layers = move.stock_valuation_layer_ids.filtered(lambda svl: svl.quantity < 0)
+            else:
+                layers = move.stock_valuation_layer_ids
+            total_layers_ids.update(layers.ids)
+        return self.env['stock.valuation.layer'].browse(total_layers_ids)

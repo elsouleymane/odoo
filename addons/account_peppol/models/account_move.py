@@ -8,7 +8,7 @@ from odoo.addons.account.models.company import PEPPOL_MAILING_COUNTRIES
 class AccountMove(models.Model):
     _inherit = 'account.move'
 
-    peppol_message_uuid = fields.Char(string='PEPPOL message ID')
+    peppol_message_uuid = fields.Char(string='PEPPOL message ID', copy=False)
     peppol_move_state = fields.Selection(
         selection=[
             ('ready', 'Ready to send'),
@@ -52,8 +52,12 @@ class AccountMove(models.Model):
             else:
                 move.peppol_move_state = move.peppol_move_state
 
-    def _notify_by_email_prepare_rendering_context(self, message, **kwargs):
-        render_context = super()._notify_by_email_prepare_rendering_context(message, **kwargs)
+    def _notify_by_email_prepare_rendering_context(self, message, msg_vals=False, model_description=False,
+                                                   force_email_company=False, force_email_lang=False):
+        render_context = super()._notify_by_email_prepare_rendering_context(
+            message, msg_vals=msg_vals, model_description=model_description,
+            force_email_company=force_email_company, force_email_lang=force_email_lang
+        )
         invoice = render_context['record']
         invoice_country = invoice.commercial_partner_id.country_code
         company_country = invoice.company_id.country_code

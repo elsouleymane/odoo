@@ -58,7 +58,7 @@ class ProjectTask(models.Model):
     @api.depends('sale_line_id', 'project_id', 'allow_billable')
     def _compute_sale_order_id(self):
         for task in self:
-            if not task.allow_billable:
+            if not (task.allow_billable and task.sale_line_id):
                 task.sale_order_id = False
                 continue
             sale_order = (
@@ -108,9 +108,11 @@ class ProjectTask(models.Model):
                 sale_line = False
                 if task.parent_id.sale_line_id and task.parent_id.partner_id.commercial_partner_id == task.partner_id.commercial_partner_id:
                     sale_line = task.parent_id.sale_line_id
+                elif task.milestone_id.sale_line_id:
+                    sale_line = task.milestone_id.sale_line_id
                 elif task.project_id.sale_line_id and task.project_id.partner_id.commercial_partner_id == task.partner_id.commercial_partner_id:
                     sale_line = task.project_id.sale_line_id
-                task.sale_line_id = sale_line or task.milestone_id.sale_line_id
+                task.sale_line_id = sale_line
 
     @api.depends('sale_order_id')
     def _compute_display_sale_order_button(self):

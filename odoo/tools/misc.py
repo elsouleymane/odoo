@@ -29,7 +29,7 @@ from collections import defaultdict
 from collections.abc import Iterable, Iterator, Mapping, MutableMapping, MutableSet, Reversible
 from contextlib import ContextDecorator, contextmanager
 from difflib import HtmlDiff
-from functools import reduce, wraps
+from functools import lru_cache, reduce, wraps
 from itertools import islice, groupby as itergroupby
 from operator import itemgetter
 
@@ -461,8 +461,9 @@ except ImportError:
 
 def get_iso_codes(lang: str) -> str:
     if lang.find('_') != -1:
-        if lang.split('_')[0] == lang.split('_')[1].lower():
-            lang = lang.split('_')[0]
+        lang_items = lang.split('_')
+        if lang_items[0] == lang_items[1].lower():
+            lang = lang_items[0]
     return lang
 
 
@@ -820,12 +821,22 @@ class lower_logging(logging.Handler):
             record.levelname = f'_{record.levelname}'
             record.levelno = self.to_level
             self.had_error_log = True
-            record.args = tuple(arg.replace('Traceback (most recent call last):', '_Traceback_ (most recent call last):') if isinstance(arg, str) else arg for arg in record.args)
+            if MungedTracebackLogRecord.__base__ is logging.LogRecord:
+                MungedTracebackLogRecord.__bases__ = (record.__class__,)
+            record.__class__ = MungedTracebackLogRecord
 
         if logging.getLogger(record.name).isEnabledFor(record.levelno):
             for handler in self.old_handlers:
                 if handler.level <= record.levelno:
                     handler.emit(record)
+
+
+class MungedTracebackLogRecord(logging.LogRecord):
+    def getMessage(self):
+        return super().getMessage().replace(
+            'Traceback (most recent call last):',
+            '_Traceback_ (most recent call last):',
+        )
 
 
 def stripped_sys_argv(*strip_args):
@@ -1166,6 +1177,9 @@ class Callbacks:
         self._funcs.clear()
         self.data.clear()
 
+    def __len__(self) -> int:
+        return len(self._funcs)
+
 
 class ReversedIterable(Reversible[T], typing.Generic[T]):
     """ An iterable implementing the reversal of another iterable. """
@@ -1309,6 +1323,7 @@ def get_lang(env: Environment, lang_code: str | None = None) -> LangData:
     return env['res.lang']._get_data(code=lang)
 
 
+@lru_cache
 def babel_locale_parse(lang_code: str | None) -> babel.Locale:
     if lang_code:
         try:
